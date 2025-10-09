@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod bit_banging;
 pub mod common;
 pub mod dshot;
 pub mod telemetry;
