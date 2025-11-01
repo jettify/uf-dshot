@@ -7,4 +7,4 @@ pub mod telemetry;
 
 pub use common::{Command, DShotValue};
 pub use dshot::{BiDirDShotFrame, DShotFrame, Frame};
-pub use telemetry::{Telemetry, TelemetryError, decode_gcr, parse_telemetry_payload};
+pub use telemetry::{decode_gcr, parse_telemetry_payload, Telemetry, TelemetryError};

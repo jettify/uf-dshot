@@ -2,6 +2,7 @@ use crate::{Command, DShotValue};
 
 pub trait Frame {
     fn to_payload(&self) -> u16;
+    fn duty_cycles(&self, max_duty_cycle: u16) -> [u16; 17];
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -42,6 +43,23 @@ impl Frame for DShotFrame {
     fn to_payload(&self) -> u16 {
         crate::common::to_payload(self.value, self.telemetry_request, calculate_crc)
     }
+
+    fn duty_cycles(&self, max_duty_cycle: u16) -> [u16; 17] {
+        let one = max_duty_cycle * 3 / 4;
+        let zero = max_duty_cycle * 3 / 8;
+
+        let mut value = self.to_payload();
+        let mut rv = [one; 17];
+        for item in rv.iter_mut() {
+            let bit = value & 0x8000;
+            if bit == 0 {
+                *item = zero;
+            }
+            value <<= 1;
+        }
+        rv[16] = 0;
+        rv
+    }
 }
 
 /// Represents a Bidirectional DShot frame.
@@ -70,6 +88,22 @@ impl BiDirDShotFrame {
 impl Frame for BiDirDShotFrame {
     fn to_payload(&self) -> u16 {
         crate::common::to_payload(self.value, true, calculate_inverted_crc)
+    }
+
+    fn duty_cycles(&self, max_duty_cycle: u16) -> [u16; 17] {
+        let one = max_duty_cycle * 3 / 8;
+        let zero = max_duty_cycle * 3 / 4;
+        let mut value = self.to_payload();
+        let mut rv = [one; 17];
+        for item in rv.iter_mut() {
+            let bit = value & 0x8000;
+            if bit == 0 {
+                *item = zero;
+            }
+            value <<= 1;
+        }
+        rv[16] = 0;
+        rv
     }
 }
 
