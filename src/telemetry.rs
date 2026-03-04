@@ -60,6 +60,44 @@ pub fn parse_telemetry_payload(payload: u16) -> Result<Telemetry, TelemetryError
     }
 }
 
+/// Convert a telemetry eRPM period into eRPM * 100.
+/// Returns 0 if the period is zero.
+pub fn erpm_period_to_erpm_x100(period: u16) -> u32 {
+    if period == 0 {
+        return 0;
+    }
+    let period = period as u32;
+    (1_000_000 * 60 / 100 + period / 2) / period
+}
+
+/// Convert eRPM * 100 into mechanical RPM for a given number of pole pairs.
+pub fn erpm_x100_to_rpm(erpm_x100: u32, pole_pairs: u8) -> u32 {
+    if pole_pairs == 0 {
+        return 0;
+    }
+    (erpm_x100 / 100) / (pole_pairs as u32)
+}
+
+/// Convert eRPM * 100 into mechanical Hz for a given number of pole pairs.
+pub fn erpm_x100_to_hz(erpm_x100: u32, pole_pairs: u8) -> u32 {
+    if pole_pairs == 0 {
+        return 0;
+    }
+    (erpm_x100 / 100) / (pole_pairs as u32) / 60
+}
+
+/// Convert a telemetry eRPM period into mechanical RPM for a given number of pole pairs.
+pub fn erpm_period_to_rpm(period: u16, pole_pairs: u8) -> u32 {
+    let erpm_x100 = erpm_period_to_erpm_x100(period);
+    erpm_x100_to_rpm(erpm_x100, pole_pairs)
+}
+
+/// Convert a telemetry eRPM period into mechanical Hz for a given number of pole pairs.
+pub fn erpm_period_to_hz(period: u16, pole_pairs: u8) -> u32 {
+    let erpm_x100 = erpm_period_to_erpm_x100(period);
+    erpm_x100_to_hz(erpm_x100, pole_pairs)
+}
+
 const GCR_DECODE_TABLE: [u8; 32] = [
     // 0x00 - 0x07
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 0x08 - 0x0F
@@ -192,5 +230,45 @@ mod tests {
         assert_eq!(encode_gcr(23130), 0b100110011001100110011);
         assert_eq!(decode_gcr(0b011001100110011001100).unwrap(), 23130);
         assert_eq!(decode_gcr(0b100110011001100110011).unwrap(), 23130);
+    }
+
+    #[test]
+    fn test_decode_gcr_invalid_chunks() {
+        // All zeros map to invalid GCR chunks.
+        assert_eq!(decode_gcr(0), None);
+        // Short random invalid matrix cases.
+        assert_eq!(decode_gcr(0b000000000000000000001), None);
+        assert_eq!(decode_gcr(0b111111111111111111111), None);
+    }
+
+    #[test]
+    fn test_parse_extended_telemetry_types() {
+        // Type 0x06 (current) with value 0x55 and valid crc.
+        let data = 0x655;
+        let payload = (data << 4) | (calculate_crc(data) as u16);
+        assert_eq!(parse_telemetry_payload(payload), Ok(Telemetry::Current(0x55)));
+
+        // Another reachable extended type (0x0A).
+        let data = 0xA55;
+        let payload = (data << 4) | (calculate_crc(data) as u16);
+        assert_eq!(parse_telemetry_payload(payload), Ok(Telemetry::Debug2(0x55)));
+    }
+
+    #[test]
+    fn test_erpm_conversions() {
+        let period = 1;
+        let erpm_x100 = erpm_period_to_erpm_x100(period);
+        assert!(erpm_x100 > 0);
+        let rpm = erpm_period_to_rpm(period, 7);
+        let hz = erpm_period_to_hz(period, 7);
+        assert!(rpm > 0);
+        assert!(hz > 0);
+    }
+
+    #[test]
+    fn test_erpm_conversion_zero_guards() {
+        assert_eq!(erpm_period_to_erpm_x100(0), 0);
+        assert_eq!(erpm_x100_to_rpm(1000, 0), 0);
+        assert_eq!(erpm_x100_to_hz(1000, 0), 0);
     }
 }

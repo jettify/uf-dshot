@@ -7,6 +7,17 @@ license = "Apache-2.0"
 
 [dependencies]
 defmt = { version = "1.0.1", optional = true }
+embassy-stm32 = { version = "0.4.0", features = [
+  "time-driver-any",
+  "exti",
+  "unstable-pac",
+], optional = true, default-features = false }
 
 [features]
+default = []
 "defmt" = ["dep:defmt"]
+std = []
+embassy = []
+embassy-stm32 = ["dep:embassy-stm32", "embassy"]
+stm32f405 = ["embassy-stm32", "embassy-stm32/stm32f405rg"]
+stm32f411 = ["embassy-stm32", "embassy-stm32/stm32f411ce"]

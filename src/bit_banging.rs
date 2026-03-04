@@ -1,5 +1,6 @@
 /// Represents the possible errors during the decoding process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DecodeError {
     /// The provided bit index is out of the valid range (0-15).
     InvalidBit,
@@ -54,8 +55,6 @@ pub fn decode_gcr_from_samples(
 
     // --- Constants based on DShot telemetry protocol ---
     const TOTAL_EXPECTED_BITS: u32 = 21;
-    // A frame is considered invalid if fewer than 18 bits are detected before inference.
-    const MIN_DETECTED_BITS: u32 = 18;
     // Minimum number of samples for a valid frame: (21 bits - 2 tolerance) * 3x oversampling
     const MIN_FRAME_SAMPLES: usize = (TOTAL_EXPECTED_BITS as usize - 2) * 3;
     // Maximum number of samples for a valid frame: (21 bits + 2 tolerance) * 3x oversampling
@@ -87,6 +86,7 @@ pub fn decode_gcr_from_samples(
     // --- State for edge detection loop ---
     let mut gcr_value: u32 = 0;
     let mut bits_found: u32 = 0;
+    let mut edges_found: u32 = 0;
     let mut last_edge_index = 0; // Index relative to the start of `frame_samples`
     let mut last_state_is_high = false; // We start at the first falling edge, so the state is low.
 
@@ -103,6 +103,7 @@ pub fn decode_gcr_from_samples(
             let len = ((pulse_width_samples + 1) / 3).max(1) as u32;
 
             bits_found += len;
+            edges_found += 1;
 
             // A pulse of `len` is encoded as a '''1''' followed by `len - 1` zeros.
             gcr_value <<= len;
@@ -121,16 +122,15 @@ pub fn decode_gcr_from_samples(
 
     // 3. INFER FINAL PULSE & VALIDATE: The signal always ends high, so the last falling
     // edge is absent. We infer its length based on the bits we've already found.
+    if edges_found == 0 {
+        return Err(DecodeError::NoEdge);
+    }
+
     let remaining_bits = TOTAL_EXPECTED_BITS - bits_found;
     if remaining_bits > 0 {
         // The shift amount must be less than the type's bit width.
-        // This is guaranteed by the `bits_found >= MIN_DETECTED_BITS` check.
         gcr_value <<= remaining_bits;
         gcr_value |= 1 << (remaining_bits - 1);
-    }
-
-    if bits_found + remaining_bits < MIN_DETECTED_BITS {
-        return Err(DecodeError::NoEdge);
     }
 
     Ok(DecodeResult {
@@ -179,8 +179,6 @@ mod tests {
         let bit = 0;
 
         let buffer = build_buffer(bit, preamble_len, &pulse_widths);
-        std::println!("xxxxxxxxx");
-        std::println!("{:?}", buffer);
 
         // Calculate expected GCR value from the bit lengths
         let mut expected_gcr = 0u32;
@@ -201,9 +199,10 @@ mod tests {
         let preamble_len = 10;
         let bit = 7;
 
-        let full_buffer = build_buffer(bit, preamble_len, &pulse_widths);
+        let mut full_buffer = build_buffer(bit, preamble_len, &pulse_widths);
+        full_buffer.extend([1u16 << bit; 16]);
         // Cut the buffer short in the middle of the final pulse
-        let partial_buffer = &full_buffer[..full_buffer.len() - 5];
+        let partial_buffer = &full_buffer[..full_buffer.len() - 8];
 
         let mut expected_gcr = 0u32;
         for &len in &bit_lens {
@@ -268,16 +267,22 @@ mod tests {
         let buffer = build_buffer(0, 10, &pulse_widths);
 
         let err = decode_gcr_from_samples(&buffer, 0, 0).unwrap_err();
-        assert_eq!(err, DecodeError::NoEdge);
+        assert_eq!(err, DecodeError::InvalidFrame);
     }
 
     #[test]
     fn test_error_too_many_bits() {
-        // A pulse in the middle makes the bit count exceed 21
-        let bit_lens = [5, 5, 5, 7]; // Sum to 22
-        let pulse_widths: Vec<usize> = bit_lens.iter().map(|&len| len * 3 - 1).collect();
+        // First low pulse is very long and decodes to >21 bits immediately.
+        let pulse_widths = [68, 3];
         let buffer = build_buffer(0, 10, &pulse_widths);
 
+        let err = decode_gcr_from_samples(&buffer, 0, 0).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidFrame);
+    }
+
+    #[test]
+    fn test_error_invalid_frame_on_short_search_window() {
+        let buffer = build_buffer(0, 40, &[2, 2, 2, 2, 2, 2]);
         let err = decode_gcr_from_samples(&buffer, 0, 0).unwrap_err();
         assert_eq!(err, DecodeError::InvalidFrame);
     }

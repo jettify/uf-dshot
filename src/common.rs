@@ -80,12 +80,62 @@ pub enum DShotValue {
     Command(Command),
 }
 
+pub const MAX_THROTTLE: u16 = 1999;
+
 impl DShotValue {
+    /// Creates a throttle value and clamps any value above [`MAX_THROTTLE`].
     pub fn new_clipped_throttle(throttle: u16) -> Self {
-        Self::Throttle(u16::min(throttle, 1999))
+        Self::Throttle(u16::min(throttle, MAX_THROTTLE))
     }
+
+    /// Creates a throttle value and returns `None` when `throttle > MAX_THROTTLE`.
+    pub fn new_checked_throttle(throttle: u16) -> Option<Self> {
+        if throttle <= MAX_THROTTLE {
+            Some(Self::Throttle(throttle))
+        } else {
+            None
+        }
+    }
+
     pub fn new_command(command: Command) -> Self {
         Self::Command(command)
+    }
+}
+
+/// Converts throttle percent in the `[0.0, 100.0]` range to a DShot throttle value.
+/// Values outside the range are clamped.
+pub fn throttle_percent_to_value(percent: f32) -> u16 {
+    let clamped = percent.clamp(0.0, 100.0);
+    ((clamped * (MAX_THROTTLE as f32) / 100.0) + 0.5) as u16
+}
+
+/// Converts a DShot throttle value to percent in the `[0.0, 100.0]` range.
+/// Values above [`MAX_THROTTLE`] are treated as [`MAX_THROTTLE`].
+pub fn throttle_value_to_percent(value: u16) -> f32 {
+    let clamped = value.min(MAX_THROTTLE);
+    (clamped as f32) * 100.0 / (MAX_THROTTLE as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_throttle_bounds() {
+        assert_eq!(DShotValue::new_checked_throttle(0), Some(DShotValue::Throttle(0)));
+        assert_eq!(
+            DShotValue::new_checked_throttle(MAX_THROTTLE),
+            Some(DShotValue::Throttle(MAX_THROTTLE))
+        );
+        assert_eq!(DShotValue::new_checked_throttle(MAX_THROTTLE + 1), None);
+    }
+
+    #[test]
+    fn percent_conversion_clamps() {
+        assert_eq!(throttle_percent_to_value(-10.0), 0);
+        assert_eq!(throttle_percent_to_value(100.0), MAX_THROTTLE);
+        assert_eq!(throttle_percent_to_value(150.0), MAX_THROTTLE);
+        assert_eq!(throttle_value_to_percent(MAX_THROTTLE + 100), 100.0);
     }
 }
 

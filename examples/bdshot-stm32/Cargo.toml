@@ -29,7 +29,7 @@ embassy-stm32 = { version = "0.4.0", features = [
   "exti",
   "unstable-pac",
 ] }
-uf-dshot = { path = "../../", features = ["defmt"] }
+uf-dshot = { path = "../../", features = ["defmt", "embassy-stm32", "stm32f411"] }
 
 [[bin]]
 name = "bdshot-stm32"
@@ -39,14 +39,17 @@ bench = false
 [profile.dev]
 debug = true
 lto = true
-opt-level = "z"
+opt-level = 3
 incremental = true
+overflow-checks = false
 
 [profile.release]
 debug = false
 lto = true
 opt-level = "z"
 incremental = true
+codegen-units = 1
+overflow-checks = false
 
 [features]
 defmt = ["dep:defmt"]
