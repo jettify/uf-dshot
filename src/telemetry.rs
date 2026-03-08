@@ -163,6 +163,23 @@ pub enum TelemetryPipelineError {
 }
 
 const STREAM_BUFFER_CAPACITY: usize = 256;
+const PAYLOAD_DATA_SHIFT: u16 = 4;
+const PAYLOAD_CRC_MASK: u16 = 0x0F;
+const PERIOD_EXPONENT_SHIFT: u16 = 9;
+const PERIOD_EXPONENT_MASK: u16 = 0b111;
+const PERIOD_MANTISSA_MASK: u16 = 0x1FF;
+const EXTENDED_EXPONENT_FLAG_MASK: u16 = 0b001;
+const EXTENDED_MANTISSA_FLAG_MASK: u16 = 0x100;
+const EXTENDED_TYPE_SHIFT: u16 = 8;
+const EXTENDED_VALUE_MASK: u16 = 0xFF;
+const EXTENDED_TYPE_TEMPERATURE: u8 = 0x02;
+const EXTENDED_TYPE_VOLTAGE: u8 = 0x04;
+const EXTENDED_TYPE_CURRENT: u8 = 0x06;
+const EXTENDED_TYPE_DEBUG1: u8 = 0x08;
+const EXTENDED_TYPE_DEBUG2: u8 = 0x0A;
+const EXTENDED_TYPE_DEBUG3: u8 = 0x0C;
+const EXTENDED_TYPE_STATE_EVENT: u8 = 0x0E;
+const ERPM_SENTINEL_OUT_OF_RANGE: u16 = 0x0FFF;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -324,33 +341,33 @@ impl BidirDecoder {
             }
             Err(TelemetryPipelineError::Samples(SampleDecodeError::InvalidFrame)) => {
                 self.stats.invalid_frame = self.stats.invalid_frame.saturating_add(1);
-                Some(Err(TelemetryPipelineError::Samples(
+                Self::emit_err(TelemetryPipelineError::Samples(
                     SampleDecodeError::InvalidFrame,
-                )))
+                ))
             }
             Err(TelemetryPipelineError::Samples(err)) => {
-                Some(Err(TelemetryPipelineError::Samples(err)))
+                Self::emit_err(TelemetryPipelineError::Samples(err))
             }
             Err(TelemetryPipelineError::GcrDecode(GcrDecodeError::InvalidGcrSymbol)) => {
                 self.stats.invalid_gcr_symbol = self.stats.invalid_gcr_symbol.saturating_add(1);
-                Some(Err(TelemetryPipelineError::GcrDecode(
+                Self::emit_err(TelemetryPipelineError::GcrDecode(
                     GcrDecodeError::InvalidGcrSymbol,
-                )))
+                ))
             }
             Err(TelemetryPipelineError::PayloadParse(PayloadParseError::InvalidCrc {
                 calculated_crc,
                 packet_crc,
             })) => {
                 self.stats.invalid_crc = self.stats.invalid_crc.saturating_add(1);
-                Some(Err(TelemetryPipelineError::PayloadParse(
+                Self::emit_err(TelemetryPipelineError::PayloadParse(
                     PayloadParseError::InvalidCrc {
                         calculated_crc,
                         packet_crc,
                     },
-                )))
+                ))
             }
             Err(TelemetryPipelineError::PayloadParse(err)) => {
-                Some(Err(TelemetryPipelineError::PayloadParse(err)))
+                Self::emit_err(TelemetryPipelineError::PayloadParse(err))
             }
         }
     }
@@ -408,6 +425,12 @@ impl BidirDecoder {
             self.stream_tuning_state.hint.preamble_skip -= 1;
         }
     }
+
+    fn emit_err(
+        err: TelemetryPipelineError,
+    ) -> Option<Result<DecodedTelemetry, TelemetryPipelineError>> {
+        Some(Err(err))
+    }
 }
 
 fn calculate_crc(value: u16) -> u8 {
@@ -415,8 +438,8 @@ fn calculate_crc(value: u16) -> u8 {
 }
 
 pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadParseError> {
-    let data = payload >> 4;
-    let packet_crc = (payload & 0x0F) as u8;
+    let data = payload >> PAYLOAD_DATA_SHIFT;
+    let packet_crc = (payload & PAYLOAD_CRC_MASK) as u8;
     let calculated_crc = calculate_crc(data);
 
     if packet_crc != calculated_crc {
@@ -426,20 +449,20 @@ pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadPa
         });
     }
 
-    let exponent = (data >> 9) & 0b111;
-    let mantissa = data & 0x1FF;
+    let exponent = (data >> PERIOD_EXPONENT_SHIFT) & PERIOD_EXPONENT_MASK;
+    let mantissa = data & PERIOD_MANTISSA_MASK;
 
-    if (exponent & 0b001) != 0 && (mantissa & 0b100000000) == 0 {
-        let telemetry_type = (data >> 8) as u8;
-        let value = (data & 0xFF) as u8;
+    if is_extended_telemetry(exponent, mantissa) {
+        let telemetry_type = (data >> EXTENDED_TYPE_SHIFT) as u8;
+        let value = (data & EXTENDED_VALUE_MASK) as u8;
         let t = match telemetry_type {
-            0x02 => TelemetryFrame::Temperature(value),
-            0x04 => TelemetryFrame::Voltage(value),
-            0x06 => TelemetryFrame::Current(value),
-            0x08 => TelemetryFrame::Debug1(value),
-            0x0A => TelemetryFrame::Debug2(value),
-            0x0C => TelemetryFrame::Debug3(value),
-            0x0E => TelemetryFrame::StateEvent(value),
+            EXTENDED_TYPE_TEMPERATURE => TelemetryFrame::Temperature(value),
+            EXTENDED_TYPE_VOLTAGE => TelemetryFrame::Voltage(value),
+            EXTENDED_TYPE_CURRENT => TelemetryFrame::Current(value),
+            EXTENDED_TYPE_DEBUG1 => TelemetryFrame::Debug1(value),
+            EXTENDED_TYPE_DEBUG2 => TelemetryFrame::Debug2(value),
+            EXTENDED_TYPE_DEBUG3 => TelemetryFrame::Debug3(value),
+            EXTENDED_TYPE_STATE_EVENT => TelemetryFrame::StateEvent(value),
             _ => TelemetryFrame::UnknownExtended {
                 type_id: telemetry_type,
                 value,
@@ -448,7 +471,7 @@ pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadPa
         Ok(t)
     } else {
         // Betaflight compatibility: 0x0FFF means out-of-range eRPM and maps to zero.
-        if data == 0x0FFF {
+        if data == ERPM_SENTINEL_OUT_OF_RANGE {
             return Ok(TelemetryFrame::Erpm(ErpmReading::new(0)));
         }
 
@@ -458,6 +481,10 @@ pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadPa
         }
         Ok(TelemetryFrame::Erpm(ErpmReading::new(period)))
     }
+}
+
+const fn is_extended_telemetry(exponent: u16, mantissa: u16) -> bool {
+    (exponent & EXTENDED_EXPONENT_FLAG_MASK) != 0 && (mantissa & EXTENDED_MANTISSA_FLAG_MASK) == 0
 }
 
 /// Convert a telemetry eRPM period into eRPM * 100.

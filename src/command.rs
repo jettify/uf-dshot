@@ -21,7 +21,7 @@ pub enum Command {
     /// Wait at least 260ms before next command.
     Beep5,
     /// Wait at least 12ms before next command.
-    ESCInfo,
+    EscInfo,
     /// Needs 6 transmissions.
     SpinDirection1,
     /// Needs 6 transmissions.
@@ -78,6 +78,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CommandTiming {
     min_gap: Duration,
     repeat_count: NonZeroU8,
@@ -118,7 +119,7 @@ impl Command {
             Command::Beep1 | Command::Beep2 | Command::Beep3 | Command::Beep4 | Command::Beep5 => {
                 260_000
             }
-            Command::ESCInfo => 12_000,
+            Command::EscInfo => 12_000,
             Command::SettingsSave => 35_000,
             _ => 0,
         }
@@ -475,7 +476,7 @@ mod tests {
 
     #[test]
     fn exec_policy_remains_derived_from_metadata() {
-        let policy = Command::ESCInfo.exec_policy();
+        let policy = Command::EscInfo.exec_policy();
         assert_eq!(policy.min_gap(), Duration::from_micros(12_000));
         assert_eq!(policy.repeat_count().get(), 1);
     }
