@@ -263,7 +263,11 @@ impl EncodedFrame {
         bits
     }
 
-    pub fn to_waveform_ticks(&self, timing: WaveformTiming, with_reset_slot: bool) -> WaveformTicks {
+    pub fn to_waveform_ticks(
+        &self,
+        timing: WaveformTiming,
+        with_reset_slot: bool,
+    ) -> WaveformTicks {
         let bits = self.bits_msb_first();
         let mut bit_high_ticks = [0u16; FRAME_BITS];
         let mut i = 0;
