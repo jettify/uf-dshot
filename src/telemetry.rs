@@ -28,6 +28,36 @@ pub struct DecodeHint {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PreambleTuningConfig {
+    pub enabled: bool,
+    pub target_start_margin: usize,
+    pub update_interval_frames: u16,
+}
+
+impl Default for PreambleTuningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 32,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct TelemetryDecoderStats {
+    pub successful_frames: u32,
+    pub no_edge: u32,
+    pub frame_too_short: u32,
+    pub invalid_frame: u32,
+    pub invalid_gcr_symbol: u32,
+    pub invalid_crc: u32,
+    pub last_start_margin: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct GcrFrame {
     pub raw_21: u32,
 }
@@ -119,6 +149,7 @@ pub enum GcrDecodeError {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PayloadParseError {
     InvalidCrc { calculated_crc: u8, packet_crc: u8 },
+    InvalidErpmPeriod,
 }
 
 pub type TelemetryError = PayloadParseError;
@@ -133,18 +164,68 @@ pub enum TelemetryPipelineError {
 
 const STREAM_BUFFER_CAPACITY: usize = 256;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct PreambleTuningState {
+    hint: DecodeHint,
+    min_start_margin: usize,
+    frames_since_update: u16,
+}
+
+impl Default for PreambleTuningState {
+    fn default() -> Self {
+        Self {
+            hint: DecodeHint { preamble_skip: 0 },
+            min_start_margin: usize::MAX,
+            frames_since_update: 0,
+        }
+    }
+}
+
 pub struct BidirDecoder {
     pub cfg: OversamplingConfig,
+    pub preamble_tuning: PreambleTuningConfig,
     stream_buf: [u16; STREAM_BUFFER_CAPACITY],
     stream_len: usize,
+    stream_tuning_state: PreambleTuningState,
+    stats: TelemetryDecoderStats,
 }
 
 impl BidirDecoder {
     pub const fn new(cfg: OversamplingConfig) -> Self {
+        Self::with_preamble_tuning(
+            cfg,
+            PreambleTuningConfig {
+                enabled: true,
+                target_start_margin: 5,
+                update_interval_frames: 32,
+            },
+        )
+    }
+
+    pub const fn with_preamble_tuning(
+        cfg: OversamplingConfig,
+        preamble_tuning: PreambleTuningConfig,
+    ) -> Self {
         Self {
             cfg,
+            preamble_tuning,
             stream_buf: [0; STREAM_BUFFER_CAPACITY],
             stream_len: 0,
+            stream_tuning_state: PreambleTuningState {
+                hint: DecodeHint { preamble_skip: 0 },
+                min_start_margin: usize::MAX,
+                frames_since_update: 0,
+            },
+            stats: TelemetryDecoderStats {
+                successful_frames: 0,
+                no_edge: 0,
+                frame_too_short: 0,
+                invalid_frame: 0,
+                invalid_gcr_symbol: 0,
+                invalid_crc: 0,
+                last_start_margin: 0,
+            },
         }
     }
 
@@ -168,6 +249,21 @@ impl BidirDecoder {
             payload,
             frame,
         })
+    }
+
+    pub fn decode_frame(
+        &self,
+        samples: &[u16],
+        hint: DecodeHint,
+    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
+        let gcr = self
+            .decode_gcr(samples, hint)
+            .map_err(TelemetryPipelineError::Samples)?;
+        let payload = self
+            .decode_payload(gcr.frame)
+            .map_err(TelemetryPipelineError::GcrDecode)?;
+        self.parse_payload(payload)
+            .map_err(TelemetryPipelineError::PayloadParse)
     }
 
     pub fn decode_gcr(
@@ -204,14 +300,112 @@ impl BidirDecoder {
             self.stream_buf[STREAM_BUFFER_CAPACITY - 1] = sample;
         }
 
-        match self.decode(&self.stream_buf[..self.stream_len], DecodeHint::default()) {
+        let mut hint = self.stream_tuning_state.hint;
+        if hint.preamble_skip >= self.stream_len {
+            hint.preamble_skip = self.stream_len.saturating_sub(1);
+        }
+
+        match self.decode(&self.stream_buf[..self.stream_len], hint) {
             Ok(decoded) => {
+                self.stats.successful_frames = self.stats.successful_frames.saturating_add(1);
+                self.stats.last_start_margin = decoded.gcr.start_margin;
+                self.observe_start_margin(decoded.gcr.start_margin);
                 self.stream_len = 0;
                 Some(Ok(decoded))
             }
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-            | Err(TelemetryPipelineError::Samples(SampleDecodeError::FrameTooShort)) => None,
-            Err(err) => Some(Err(err)),
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
+                self.stats.no_edge = self.stats.no_edge.saturating_add(1);
+                self.observe_no_edge();
+                None
+            }
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::FrameTooShort)) => {
+                self.stats.frame_too_short = self.stats.frame_too_short.saturating_add(1);
+                None
+            }
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::InvalidFrame)) => {
+                self.stats.invalid_frame = self.stats.invalid_frame.saturating_add(1);
+                Some(Err(TelemetryPipelineError::Samples(
+                    SampleDecodeError::InvalidFrame,
+                )))
+            }
+            Err(TelemetryPipelineError::Samples(err)) => {
+                Some(Err(TelemetryPipelineError::Samples(err)))
+            }
+            Err(TelemetryPipelineError::GcrDecode(GcrDecodeError::InvalidGcrSymbol)) => {
+                self.stats.invalid_gcr_symbol = self.stats.invalid_gcr_symbol.saturating_add(1);
+                Some(Err(TelemetryPipelineError::GcrDecode(
+                    GcrDecodeError::InvalidGcrSymbol,
+                )))
+            }
+            Err(TelemetryPipelineError::PayloadParse(PayloadParseError::InvalidCrc {
+                calculated_crc,
+                packet_crc,
+            })) => {
+                self.stats.invalid_crc = self.stats.invalid_crc.saturating_add(1);
+                Some(Err(TelemetryPipelineError::PayloadParse(
+                    PayloadParseError::InvalidCrc {
+                        calculated_crc,
+                        packet_crc,
+                    },
+                )))
+            }
+            Err(TelemetryPipelineError::PayloadParse(err)) => {
+                Some(Err(TelemetryPipelineError::PayloadParse(err)))
+            }
+        }
+    }
+
+    pub fn push_sample_frame(
+        &mut self,
+        sample: u16,
+    ) -> Option<Result<TelemetryFrame, TelemetryPipelineError>> {
+        self.push_sample(sample)
+            .map(|result| result.map(|decoded| decoded.frame))
+    }
+
+    pub const fn stream_hint(&self) -> DecodeHint {
+        self.stream_tuning_state.hint
+    }
+
+    pub fn set_stream_hint(&mut self, hint: DecodeHint) {
+        self.stream_tuning_state.hint = hint;
+    }
+
+    pub const fn stats(&self) -> TelemetryDecoderStats {
+        self.stats
+    }
+
+    pub fn reset_stats(&mut self) {
+        self.stats = TelemetryDecoderStats::default();
+    }
+
+    fn observe_start_margin(&mut self, start_margin: usize) {
+        if !self.preamble_tuning.enabled || self.preamble_tuning.update_interval_frames == 0 {
+            return;
+        }
+
+        if start_margin < self.stream_tuning_state.min_start_margin {
+            self.stream_tuning_state.min_start_margin = start_margin;
+        }
+        self.stream_tuning_state.frames_since_update = self
+            .stream_tuning_state
+            .frames_since_update
+            .saturating_add(1);
+
+        if self.stream_tuning_state.frames_since_update
+            >= self.preamble_tuning.update_interval_frames
+        {
+            let min_margin = self.stream_tuning_state.min_start_margin;
+            let target = self.preamble_tuning.target_start_margin;
+            self.stream_tuning_state.hint.preamble_skip = min_margin.saturating_sub(target);
+            self.stream_tuning_state.frames_since_update = 0;
+            self.stream_tuning_state.min_start_margin = usize::MAX;
+        }
+    }
+
+    fn observe_no_edge(&mut self) {
+        if self.preamble_tuning.enabled && self.stream_tuning_state.hint.preamble_skip > 0 {
+            self.stream_tuning_state.hint.preamble_skip -= 1;
         }
     }
 }
@@ -253,7 +447,15 @@ pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadPa
         };
         Ok(t)
     } else {
+        // Betaflight compatibility: 0x0FFF means out-of-range eRPM and maps to zero.
+        if data == 0x0FFF {
+            return Ok(TelemetryFrame::Erpm(ErpmReading::new(0)));
+        }
+
         let period = mantissa << exponent;
+        if period == 0 {
+            return Err(PayloadParseError::InvalidErpmPeriod);
+        }
         Ok(TelemetryFrame::Erpm(ErpmReading::new(period)))
     }
 }
@@ -388,7 +590,7 @@ fn decode_gcr_from_samples_cfg(
 
     let mut gcr_value: u32 = 0;
     let mut bits_found: u32 = 0;
-    let mut last_edge_index = 0usize;
+    let mut last_edge_index: usize = 0;
     let mut last_state_is_high = false;
 
     for (i, &sample) in frame_samples.iter().enumerate().skip(1) {
@@ -410,14 +612,14 @@ fn decode_gcr_from_samples_cfg(
         }
     }
 
+    if bits_found < min_detected_bits {
+        return Err(SampleDecodeError::InvalidFrame);
+    }
+
     let remaining_bits = frame_bits.saturating_sub(bits_found);
     if remaining_bits > 0 {
         gcr_value <<= remaining_bits;
         gcr_value |= 1 << (remaining_bits - 1);
-    }
-
-    if bits_found + remaining_bits < min_detected_bits {
-        return Err(SampleDecodeError::InvalidFrame);
     }
 
     Ok(GcrDecodeResult {
@@ -483,6 +685,86 @@ mod tests {
         out
     }
 
+    fn build_signal_samples_with_tail_level(
+        sample_bit_index: u8,
+        preamble_high: usize,
+        pulse_bits: &[usize],
+        oversampling: usize,
+        tail_high: bool,
+    ) -> [u16; 96] {
+        let mask = 1u16 << sample_bit_index;
+        let mut out = [if tail_high { mask } else { 0 }; 96];
+        let mut write = 0usize;
+
+        let mut i = 0usize;
+        while i < preamble_high && write < out.len() {
+            out[write] = mask;
+            write += 1;
+            i += 1;
+        }
+
+        let mut is_high = false;
+        for &bit_len in pulse_bits {
+            let width = (bit_len * oversampling).saturating_sub(1).max(1);
+            let level = if is_high { mask } else { 0 };
+            let mut k = 0usize;
+            while k < width && write < out.len() {
+                out[write] = level;
+                write += 1;
+                k += 1;
+            }
+            is_high = !is_high;
+        }
+
+        out
+    }
+
+    fn build_signal_samples_from_widths_with_tail_level(
+        sample_bit_index: u8,
+        preamble_high: usize,
+        pulse_width_samples: &[usize],
+        tail_high: bool,
+    ) -> [u16; 96] {
+        let mask = 1u16 << sample_bit_index;
+        let mut out = [if tail_high { mask } else { 0 }; 96];
+        let mut write = 0usize;
+
+        let mut i = 0usize;
+        while i < preamble_high && write < out.len() {
+            out[write] = mask;
+            write += 1;
+            i += 1;
+        }
+
+        let mut is_high = false;
+        for &width in pulse_width_samples {
+            let level = if is_high { mask } else { 0 };
+            let mut k = 0usize;
+            while k < width && write < out.len() {
+                out[write] = level;
+                write += 1;
+                k += 1;
+            }
+            is_high = !is_high;
+        }
+
+        out
+    }
+
+    fn gcr_raw_from_encoded_20(gcr_encoded: u32) -> u32 {
+        let mut gcr_value: u32 = 1 << 20;
+        let mut last_bit = 1;
+        let mut i = 0;
+        while i < 20 {
+            let gcr_bit = (gcr_encoded >> (19 - i)) & 1;
+            let current_bit = last_bit ^ gcr_bit;
+            gcr_value |= current_bit << (19 - i);
+            last_bit = current_bit;
+            i += 1;
+        }
+        gcr_value
+    }
+
     fn pulse_lengths_from_gcr(mut gcr: u32) -> ([usize; 21], usize) {
         let mut out = [0usize; 21];
         let mut out_len = 0usize;
@@ -523,6 +805,28 @@ mod tests {
     }
 
     #[test]
+    fn oversampling_default_matches_bf_reference_window() {
+        let cfg = OversamplingConfig::default();
+        assert_eq!(cfg.oversampling, 3);
+        assert_eq!(cfg.frame_bits, 21);
+        assert_eq!(cfg.min_detected_bits, 18);
+        assert_eq!(cfg.bit_tolerance, 2);
+
+        let min_samples = (cfg.frame_bits - cfg.bit_tolerance) as usize * cfg.oversampling as usize;
+        let max_samples = (cfg.frame_bits + cfg.bit_tolerance) as usize * cfg.oversampling as usize;
+        assert_eq!(min_samples, 57);
+        assert_eq!(max_samples, 69);
+    }
+
+    #[test]
+    fn preamble_tuning_default_matches_bf_reference() {
+        let tuning = PreambleTuningConfig::default();
+        assert!(tuning.enabled);
+        assert_eq!(tuning.target_start_margin, 5);
+        assert_eq!(tuning.update_interval_frames, 32);
+    }
+
+    #[test]
     fn payload_parse_crc_error() {
         let payload = 0x8108;
         assert_eq!(
@@ -540,6 +844,26 @@ mod tests {
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Erpm(ErpmReading::new(256)))
+        );
+    }
+
+    #[test]
+    fn payload_parse_erpm_range_sentinel_maps_to_zero() {
+        let data = 0x0FFFu16;
+        let payload = (data << 4) | calculate_crc(data) as u16;
+        assert_eq!(
+            parse_telemetry_payload(payload),
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(0)))
+        );
+    }
+
+    #[test]
+    fn payload_parse_erpm_zero_period_is_invalid() {
+        let data = 0x000u16;
+        let payload = (data << 4) | calculate_crc(data) as u16;
+        assert_eq!(
+            parse_telemetry_payload(payload),
+            Err(PayloadParseError::InvalidErpmPeriod)
         );
     }
 
@@ -646,6 +970,61 @@ mod tests {
     }
 
     #[test]
+    fn decode_gcr_stage_errors_below_min_detected_bits() {
+        let decoder = BidirDecoder::new(OversamplingConfig::default());
+        let samples = [0u16; 96];
+        assert_eq!(
+            decoder.decode_gcr(&samples, DecodeHint::default()),
+            Err(SampleDecodeError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn decode_gcr_min_detected_bits_thresholds() {
+        let decoder = BidirDecoder::new(OversamplingConfig::default());
+        let oversampling = OversamplingConfig::default().oversampling as usize;
+
+        let samples_17 = build_signal_samples_with_tail_level(0, 8, &[17, 1], oversampling, true);
+        assert_eq!(
+            decoder.decode_gcr(&samples_17, DecodeHint::default()),
+            Err(SampleDecodeError::InvalidFrame)
+        );
+
+        let samples_18 = build_signal_samples_with_tail_level(0, 8, &[18, 1], oversampling, true);
+        assert!(
+            decoder
+                .decode_gcr(&samples_18, DecodeHint::default())
+                .is_ok()
+        );
+
+        let samples_19 = build_signal_samples_with_tail_level(0, 8, &[19, 1], oversampling, true);
+        assert!(
+            decoder
+                .decode_gcr(&samples_19, DecodeHint::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn decode_gcr_rounding_threshold_bins_are_stable() {
+        let decoder = BidirDecoder::new(OversamplingConfig {
+            min_detected_bits: 1,
+            ..OversamplingConfig::default()
+        });
+        let cases = [(4usize, 1usize), (5, 2), (7, 2), (8, 3), (10, 3), (11, 4)];
+
+        for (width, expected_len) in cases {
+            let samples = build_signal_samples_from_widths_with_tail_level(0, 8, &[width, 1], true);
+            let decoded = decoder
+                .decode_gcr(&samples, DecodeHint::default())
+                .expect("expected valid frame");
+            let (pulse_lengths, pulse_len_count) = pulse_lengths_from_gcr(decoded.frame.raw_21);
+            assert!(pulse_len_count > 0);
+            assert_eq!(pulse_lengths[0], expected_len);
+        }
+    }
+
+    #[test]
     fn end_to_end_decode_known_value() {
         let payload = 23130u16;
         let gcr = encode_gcr(payload);
@@ -663,6 +1042,27 @@ mod tests {
 
         assert_eq!(decoded.payload.raw_16, payload);
         assert_eq!(decoded.frame, TelemetryFrame::Erpm(ErpmReading::new(1684)));
+    }
+
+    #[test]
+    fn end_to_end_decode_frame_known_value() {
+        let payload = 23130u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+
+        let samples = build_signal_samples(
+            0,
+            8,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+
+        let decoder = BidirDecoder::new(OversamplingConfig::default());
+        let decoded = decoder
+            .decode_frame(&samples, DecodeHint::default())
+            .unwrap();
+
+        assert_eq!(decoded, TelemetryFrame::Erpm(ErpmReading::new(1684)));
     }
 
     #[test]
@@ -701,6 +1101,138 @@ mod tests {
 
         let got = got.expect("expected streaming decode result");
         assert_eq!(got.payload.raw_16, payload);
+    }
+
+    #[test]
+    fn push_sample_frame_streaming_yields_result() {
+        let payload = 23130u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+
+        let samples = build_signal_samples(
+            0,
+            8,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        let mut got = None;
+        for sample in samples {
+            if let Some(result) = decoder.push_sample_frame(sample) {
+                got = Some(result.unwrap());
+                break;
+            }
+        }
+
+        let got = got.expect("expected streaming frame decode result");
+        assert_eq!(got, TelemetryFrame::Erpm(ErpmReading::new(1684)));
+    }
+
+    #[test]
+    fn push_sample_updates_stats_on_success() {
+        let payload = 23130u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples = build_signal_samples(
+            0,
+            8,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        for sample in samples {
+            let _ = decoder.push_sample(sample);
+        }
+
+        let stats = decoder.stats();
+        assert_eq!(stats.successful_frames, 1);
+        assert_eq!(stats.last_start_margin, 8);
+    }
+
+    #[test]
+    fn push_sample_tracks_no_edge_stats() {
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        for _ in 0..12 {
+            let _ = decoder.push_sample(1);
+        }
+        assert!(decoder.stats().no_edge > 0);
+    }
+
+    #[test]
+    fn preamble_tuning_updates_stream_hint_after_window() {
+        let payload = 23130u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples = build_signal_samples(
+            0,
+            12,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 1,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+
+        for sample in samples {
+            if decoder.push_sample(sample).is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(decoder.stream_hint().preamble_skip, 7);
+    }
+
+    #[test]
+    fn preamble_tuning_no_edge_backs_off_skip() {
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 32,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+        decoder.set_stream_hint(DecodeHint { preamble_skip: 3 });
+
+        let _ = decoder.push_sample(1);
+        assert_eq!(decoder.stream_hint().preamble_skip, 2);
+    }
+
+    #[test]
+    fn preamble_tuning_frame_too_short_does_not_backoff_skip() {
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 32,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+        decoder.set_stream_hint(DecodeHint { preamble_skip: 4 });
+
+        let _ = decoder.push_sample(0);
+        assert_eq!(decoder.stream_hint().preamble_skip, 4);
+    }
+
+    #[test]
+    fn decode_payload_bf_table_reference_vectors() {
+        let decoder = BidirDecoder::new(OversamplingConfig::default());
+
+        // 0x0123 in 4b/5b table chunks (0,1,2,3) => (25,27,18,19).
+        let valid_encoded = (25u32 << 15) | (27u32 << 10) | (18u32 << 5) | 19u32;
+        let valid_raw = gcr_raw_from_encoded_20(valid_encoded);
+        let valid = decoder.decode_payload(GcrFrame { raw_21: valid_raw });
+        assert_eq!(valid, Ok(TelemetryPayload { raw_16: 0x0123 }));
+
+        // Chunk 0 is invalid in decode table.
+        let invalid_encoded = (0u32 << 15) | (27u32 << 10) | (18u32 << 5) | 19u32;
+        let invalid_raw = gcr_raw_from_encoded_20(invalid_encoded);
+        let invalid = decoder.decode_payload(GcrFrame {
+            raw_21: invalid_raw,
+        });
+        assert_eq!(invalid, Err(GcrDecodeError::InvalidGcrSymbol));
     }
 
     #[test]
