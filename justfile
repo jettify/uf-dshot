@@ -2,6 +2,10 @@
 default:
   @just --list
 
+alias b := build
+alias t := test
+alias l := lint
+
 # Run cargo doc and open result in browser
 [group('build')]
 doc:
@@ -10,12 +14,12 @@ doc:
 # Run cargo build
 [group('build')]
 build:
-  cargo build --verbose
+  cargo build
 
 # Run cargo clean
 [group('build')]
 clean:
-  cargo clean --verbose
+  cargo clean
 
 # Install cargo tools used in package maintenance
 [group('build')]
@@ -48,6 +52,11 @@ pedantic:
 audit:
   cargo audit
 
+# Run cargo audit to vet dependencies
+[group('lint')]
+outdated:
+  cargo outdated
+
 set positional-arguments
 # Run tests for all features
 [group('test')]
@@ -63,6 +72,8 @@ cov:
 [group('test')]
 ci:
   cargo clippy --all -- -D warnings
-  cargo build --verbose
-  cargo test --all-features --verbose
+  cargo build
+  cargo test --all-features
   cargo test --examples
+
+  cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
