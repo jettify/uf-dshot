@@ -5,10 +5,8 @@ use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::low_level::Timer;
 use embassy_stm32::timer::{BasicNoCr2Instance, CoreInstance};
 
-// --- Constants remain the same ---
 const BDSHOT_RESPONSE_BITRATE: u32 = 300_000;
 const BDSHOT_RESPONSE_OVERSAMPLING: u32 = 3;
-// ... (all other constants) ...
 const RX_GAP_SAMPLES: usize = 2;
 const RX_DATA_SAMPLES: usize = 2;
 const RX_TOTAL_SAMPLES: usize = (RX_GAP_SAMPLES + RX_DATA_SAMPLES) as usize;

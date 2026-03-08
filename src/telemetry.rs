@@ -991,18 +991,14 @@ mod tests {
         );
 
         let samples_18 = build_signal_samples_with_tail_level(0, 8, &[18, 1], oversampling, true);
-        assert!(
-            decoder
-                .decode_gcr(&samples_18, DecodeHint::default())
-                .is_ok()
-        );
+        assert!(decoder
+            .decode_gcr(&samples_18, DecodeHint::default())
+            .is_ok());
 
         let samples_19 = build_signal_samples_with_tail_level(0, 8, &[19, 1], oversampling, true);
-        assert!(
-            decoder
-                .decode_gcr(&samples_19, DecodeHint::default())
-                .is_ok()
-        );
+        assert!(decoder
+            .decode_gcr(&samples_19, DecodeHint::default())
+            .is_ok());
     }
 
     #[test]
@@ -1258,12 +1254,18 @@ mod tests {
         // Type 0x06 (current) with value 0x55 and valid crc.
         let data = 0x655;
         let payload = (data << 4) | (calculate_crc(data) as u16);
-        assert_eq!(parse_telemetry_payload(payload), Ok(Telemetry::Current(0x55)));
+        assert_eq!(
+            parse_telemetry_payload(payload),
+            Ok(TelemetryFrame::Current(0x55))
+        );
 
         // Another reachable extended type (0x0A).
         let data = 0xA55;
         let payload = (data << 4) | (calculate_crc(data) as u16);
-        assert_eq!(parse_telemetry_payload(payload), Ok(Telemetry::Debug2(0x55)));
+        assert_eq!(
+            parse_telemetry_payload(payload),
+            Ok(TelemetryFrame::Debug2(0x55))
+        );
     }
 
     #[test]
