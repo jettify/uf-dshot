@@ -256,10 +256,8 @@ impl EncodedFrame {
 
     pub fn bits_msb_first(&self) -> [bool; 16] {
         let mut bits = [false; FRAME_BITS];
-        let mut i = 0;
-        while i < FRAME_BITS {
-            bits[i] = ((self.payload >> (FRAME_BITS - 1 - i)) & 1) != 0;
-            i += 1;
+        for (i, bit) in bits.iter_mut().enumerate() {
+            *bit = ((self.payload >> (FRAME_BITS - 1 - i)) & 1) != 0;
         }
         bits
     }
@@ -271,14 +269,12 @@ impl EncodedFrame {
     ) -> WaveformTicks {
         let bits = self.bits_msb_first();
         let mut bit_high_ticks = [0u16; FRAME_BITS];
-        let mut i = 0;
-        while i < FRAME_BITS {
-            bit_high_ticks[i] = if bits[i] {
+        for (tick, bit) in bit_high_ticks.iter_mut().zip(bits.iter()) {
+            *tick = if *bit {
                 timing.bit1_high_ticks
             } else {
                 timing.bit0_high_ticks
             };
-            i += 1;
         }
 
         WaveformTicks {
@@ -321,7 +317,7 @@ impl UniTx {
     pub fn encode(self) -> EncodedFrame {
         let data_12 = encode_data_12(self.value, self.request_separate_wire_telemetry);
         let crc_4 = base_crc(data_12);
-        let payload = (data_12 << 4) | crc_4 as u16;
+        let payload = (data_12 << 4) | u16::from(crc_4);
 
         EncodedFrame { payload }
     }
@@ -349,7 +345,7 @@ impl BidirTx {
         // Bidirectional DShot always sets the telemetry bit in the TX frame.
         let data_12 = encode_data_12(self.value, true);
         let crc_4 = (!base_crc(data_12)) & 0x0F;
-        let payload = (data_12 << 4) | crc_4 as u16;
+        let payload = (data_12 << 4) | u16::from(crc_4);
 
         EncodedFrame { payload }
     }
@@ -361,7 +357,7 @@ fn encode_data_12(value: FrameValue, telemetry_request: bool) -> u16 {
         FrameValue::Throttle(t) => t.get() + THROTTLE_VALUE_OFFSET,
     };
 
-    (raw_value << 1) | telemetry_request as u16
+    (raw_value << 1) | u16::from(telemetry_request)
 }
 
 fn base_crc(data_12: u16) -> u8 {

@@ -493,7 +493,7 @@ pub fn erpm_period_to_erpm_x100(period: u16) -> u32 {
     if period == 0 {
         return 0;
     }
-    let period = period as u32;
+    let period = u32::from(period);
     (1_000_000 * 60 / 100 + period / 2) / period
 }
 
@@ -502,7 +502,7 @@ pub fn erpm_x100_to_rpm(erpm_x100: u32, pole_pairs: u8) -> u32 {
     if pole_pairs == 0 {
         return 0;
     }
-    (erpm_x100 / 100) / (pole_pairs as u32)
+    (erpm_x100 / 100) / u32::from(pole_pairs)
 }
 
 /// Convert eRPM * 100 into mechanical Hz for a given number of pole pairs.
@@ -510,7 +510,7 @@ pub fn erpm_x100_to_hz(erpm_x100: u32, pole_pairs: u8) -> u32 {
     if pole_pairs == 0 {
         return 0;
     }
-    (erpm_x100 / 100) / (pole_pairs as u32) / 60
+    (erpm_x100 / 100) / u32::from(pole_pairs) / 60
 }
 
 /// Convert a telemetry eRPM period into mechanical RPM for a given number of pole pairs.
@@ -541,7 +541,7 @@ pub fn decode_gcr(gcr_value: u32) -> Option<u16> {
         if nibble == 0xFF {
             return None;
         }
-        result = (result << 4) | nibble as u16;
+        result = (result << 4) | u16::from(nibble);
         i += 1;
     }
     Some(result)
@@ -557,7 +557,7 @@ pub fn encode_gcr(payload: u16) -> u32 {
     let mut i = 0;
     while i < 4 {
         let nibble = (payload >> (12 - i * 4)) & 0x0F;
-        let chunk = GCR_ENCODE_TABLE[nibble as usize] as u32;
+        let chunk = u32::from(GCR_ENCODE_TABLE[nibble as usize]);
         gcr_encoded = (gcr_encoded << 5) | chunk;
         i += 1;
     }
@@ -593,8 +593,8 @@ fn decode_gcr_from_samples_cfg(
     }
 
     let oversampling = cfg.oversampling as usize;
-    let frame_bits = cfg.frame_bits as u32;
-    let min_detected_bits = cfg.min_detected_bits as u32;
+    let frame_bits = u32::from(cfg.frame_bits);
+    let min_detected_bits = u32::from(cfg.min_detected_bits);
     let min_frame_samples =
         cfg.frame_bits.saturating_sub(cfg.bit_tolerance) as usize * oversampling;
     let max_frame_samples = (cfg.frame_bits as usize + cfg.bit_tolerance as usize) * oversampling;
