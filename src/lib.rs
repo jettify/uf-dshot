@@ -1,5 +1,8 @@
 #![no_std]
+
 pub mod command;
+#[cfg(feature = "embassy-stm32")]
+pub mod embassy_stm32;
 pub mod telemetry;
 
 pub use command::{
