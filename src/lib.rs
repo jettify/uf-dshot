@@ -3,7 +3,7 @@ pub mod command;
 pub mod telemetry;
 
 pub use command::{
-    //
+    // comment just to make one item per line
     BidirTx,
     Command,
     DshotSpeed,
@@ -17,7 +17,7 @@ pub use command::{
     WaveformTiming,
 };
 pub use telemetry::{
-    //
+    // comment just to make one item per line
     BidirDecoder,
     DecodeHint,
     DecodedTelemetry,
