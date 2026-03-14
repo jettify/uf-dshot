@@ -1,7 +1,7 @@
 #![no_std]
 
 pub mod command;
-#[cfg(feature = "embassy-stm32")]
+#[cfg(all(feature = "embassy-stm32", target_arch = "arm", target_os = "none"))]
 pub mod embassy_stm32;
 pub mod telemetry;
 
