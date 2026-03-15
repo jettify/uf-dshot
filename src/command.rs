@@ -207,7 +207,7 @@ pub struct WaveformTiming {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct WaveformTicks {
     pub bit_high_ticks: [u16; 16],
-    /// Optional duration of one explicit reset-low slot after the 16 frame bits.
+    /// Optional trailing slot value for backends that append one explicit low reset period.
     pub reset_low_ticks: Option<u16>,
 }
 
@@ -280,7 +280,7 @@ impl EncodedFrame {
         WaveformTicks {
             bit_high_ticks,
             reset_low_ticks: if with_reset_slot {
-                Some(timing.period_ticks)
+                Some(0)
             } else {
                 None
             },
@@ -452,7 +452,7 @@ mod tests {
         let with_reset = frame.to_waveform_ticks(timing, true);
         let no_reset = frame.to_waveform_ticks(timing, false);
 
-        assert_eq!(with_reset.reset_low_ticks, Some(100));
+        assert_eq!(with_reset.reset_low_ticks, Some(0));
         assert_eq!(no_reset.reset_low_ticks, None);
         assert_eq!(with_reset.bit_high_ticks[10], 75);
         assert_eq!(with_reset.bit_high_ticks[0], 37);
