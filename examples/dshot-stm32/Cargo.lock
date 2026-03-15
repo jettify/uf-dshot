@@ -788,7 +788,6 @@ name = "uf-dshot"
 version = "0.1.0"
 dependencies = [
  "defmt 1.0.1",
- "embassy-stm32",
 ]
 
 [[package]]
