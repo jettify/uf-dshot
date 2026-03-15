@@ -215,7 +215,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dshot-stm32"
+name = "dshot-simplepwm-stm32"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
