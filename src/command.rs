@@ -279,11 +279,7 @@ impl EncodedFrame {
 
         WaveformTicks {
             bit_high_ticks,
-            reset_low_ticks: if with_reset_slot {
-                Some(0)
-            } else {
-                None
-            },
+            reset_low_ticks: if with_reset_slot { Some(0) } else { None },
         }
     }
 }

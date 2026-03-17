@@ -72,8 +72,16 @@ cov:
 [group('test')]
 ci:
   cargo clippy --all -- -D warnings
+  cargo check
   cargo build
   cargo test --all-features
-  cargo test --examples
+  just ci-stm32
 
+[group('test')]
+ci-stm32:
+  cargo check --manifest-path examples/dshot-dma-stm32/Cargo.toml --target thumbv7em-none-eabihf
+  cargo check --manifest-path examples/bdshot-stm32/Cargo.toml --target thumbv7em-none-eabihf
+
+[group('test')]
+coverage:
   cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
