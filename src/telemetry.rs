@@ -283,6 +283,28 @@ impl BidirDecoder {
             .map_err(TelemetryPipelineError::PayloadParse)
     }
 
+    pub fn decode_frame_tuned(
+        &mut self,
+        samples: &[u16],
+    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
+        let mut hint = self.stream_tuning_state.hint;
+        if hint.preamble_skip >= samples.len() {
+            hint.preamble_skip = samples.len().saturating_sub(1);
+        }
+
+        match self.decode(samples, hint) {
+            Ok(decoded) => {
+                self.observe_start_margin(decoded.gcr.start_margin);
+                Ok(decoded.frame)
+            }
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
+                self.observe_no_edge();
+                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn decode_gcr(
         &self,
         samples: &[u16],
@@ -1237,6 +1259,49 @@ mod tests {
 
         let _ = decoder.push_sample(0);
         assert_eq!(decoder.stream_hint().preamble_skip, 4);
+    }
+
+    #[test]
+    fn decode_frame_tuned_updates_hint_after_success() {
+        let payload = 23130u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples = build_signal_samples(
+            0,
+            12,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 1,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+
+        let frame = decoder.decode_frame_tuned(&samples);
+        assert!(frame.is_ok());
+        assert_eq!(decoder.stream_hint().preamble_skip, 7);
+    }
+
+    #[test]
+    fn decode_frame_tuned_no_edge_backs_off_hint() {
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 32,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+        decoder.set_stream_hint(DecodeHint { preamble_skip: 3 });
+
+        let samples = [1u16; 96];
+        let frame = decoder.decode_frame_tuned(&samples);
+        assert_eq!(
+            frame,
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+        );
+        assert_eq!(decoder.stream_hint().preamble_skip, 2);
     }
 
     #[test]
