@@ -29,7 +29,7 @@ embassy-stm32 = { version = "0.4.0", features = [
   "exti",
   "unstable-pac",
 ] }
-uf-dshot = { path = "../../", features = ["defmt"] }
+uf-dshot = { path = "../../", features = ["defmt", "embassy-stm32"] }
 
 [[bin]]
 name = "dshot-dma-stm32"

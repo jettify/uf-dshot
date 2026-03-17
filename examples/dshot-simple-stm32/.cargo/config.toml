@@ -1,6 +1,6 @@
 # This file was automatically generated.
 
-[target.thumbv7em-none-eabi]
+[target.thumbv7em-none-eabihf]
 runner = 'probe-rs run --chip STM32F411CEUx'
 
 [build]

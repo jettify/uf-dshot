@@ -1,49 +1,51 @@
 #![no_std]
 #![no_main]
 
+#[macro_use]
 mod fmt;
 
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{AnyPin, Flex, Pin as _};
-use embassy_stm32::timer::low_level::Timer;
-use embassy_stm32::timer::Channel as TimerChannel;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::watch::{Receiver, Watch};
-use embassy_time::{Duration, Timer as EmbassyTimer};
-use fmt::info;
+use embassy_sync::watch::{Receiver, Sender, Watch};
+use embassy_time::{Duration, Ticker, Timer as EmbassyTimer};
 
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use uf_dshot::{
-    BidirDecodeConfig, BiDirDShotFrame, BidirLine, Frame, Stm32BidirController, Stm32BidirParts,
-};
+use uf_dshot::embassy_stm32::{DshotTxPin, Stm32BidirCapture, Stm32BidirController};
+use uf_dshot::{DshotSpeed, OversamplingConfig};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
 static MOTOR_THROTTLE: Watch<ThreadModeRawMutex, u16, 1> = Watch::new_with(0);
 
-const DSHOT_BITRATE_HZ: u32 = 300_000;
-const TELEMETRY_OVERSAMPLE: u32 = 3;
-const TELEMETRY_SAMPLE_HZ: u32 = DSHOT_BITRATE_HZ * TELEMETRY_OVERSAMPLE;
-const TELEMETRY_SAMPLES: usize = 69;
+const ARMING_DELAY_MS: u64 = 7_000;
+const TX_PERIOD_US: u64 = 70;
+const TELEMETRY_LOG_EVERY_FRAMES: u32 = 20_000;
+const DEMO_THROTTLE_MAX_PERCENT: u16 = 25;
+const DSHOT_MAX_THROTTLE: u16 = 1_999;
 
-struct BoardConfig {
-    line: BidirLine<'static>,
-    pin_bit: u32,
-    idr_addr: *mut u16,
-    send_timer: Timer<'static, embassy_stm32::peripherals::TIM1>,
-    send_dma: embassy_stm32::Peri<'static, embassy_stm32::peripherals::DMA2_CH5>,
-    send_channel: TimerChannel,
-    sample_timer: Timer<'static, embassy_stm32::peripherals::TIM2>,
-    sample_dma: embassy_stm32::Peri<'static, embassy_stm32::peripherals::DMA1_CH1>,
+fn throttle_percent_to_raw(percent: u16) -> u16 {
+    let clamped = percent.clamp(0, 100);
+    ((clamped as u32 * DSHOT_MAX_THROTTLE as u32) / 100) as u16
 }
 
-fn make_cycles(throttle: u16, max_duty: u16) -> [u16; 17] {
-    let throttle = throttle.clamp(0, 100);
-    let value = (2000 * throttle) / 100;
-    let frame = BiDirDShotFrame::new_throttle(value);
-    frame.duty_cycles(max_duty)
+async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
+    EmbassyTimer::after(Duration::from_millis(ARMING_DELAY_MS)).await;
+    info!("start loop");
+
+    loop {
+        for value in 0..=DEMO_THROTTLE_MAX_PERCENT {
+            sender.send(value);
+            info!("bdshot up {}", value);
+            EmbassyTimer::after(Duration::from_secs(1)).await;
+        }
+        for value in (0..=DEMO_THROTTLE_MAX_PERCENT).rev() {
+            sender.send(value);
+            info!("bdshot down {}", value);
+            EmbassyTimer::after(Duration::from_secs(1)).await;
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -51,26 +53,46 @@ async fn motor_task(
     mut controller: Stm32BidirController<
         'static,
         embassy_stm32::peripherals::TIM1,
-        embassy_stm32::peripherals::TIM2,
         embassy_stm32::peripherals::DMA2_CH5,
+        embassy_stm32::peripherals::TIM2,
         embassy_stm32::peripherals::DMA1_CH1,
     >,
     mut receiver: Receiver<'static, ThreadModeRawMutex, u16, 1>,
 ) -> ! {
-    let mut throttle: u16 = 0;
-    let mut counter = 0u32;
-    let mut buffer = [0u16; TELEMETRY_SAMPLES];
+    unwrap!(controller.arm().await);
+
+    let mut ticker = Ticker::every(Duration::from_micros(TX_PERIOD_US));
+    let mut frames_sent = 0u32;
+    let mut throttle_percent = 0u16;
+
+    info!("tx/rx loop started dshot300");
 
     loop {
-        counter = counter.wrapping_add(1);
-        throttle = receiver.try_get().unwrap_or(throttle);
+        frames_sent = frames_sent.wrapping_add(1);
+        throttle_percent = receiver.try_get().unwrap_or(throttle_percent);
 
-        let cycles = make_cycles(throttle, controller.max_duty());
-        match controller.send_and_receive(&cycles, &mut buffer).await {
-            Ok(frame) if counter % 1000 == 0 => info!("telemetry: {:?}", frame.telemetry),
-            Err(err) if counter % 1000 == 0 => info!("telemetry err: {:?}", err),
+        let raw_throttle = throttle_percent_to_raw(throttle_percent);
+        match controller.send_throttle_and_receive(raw_throttle).await {
+            Ok(frame) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
+                info!(
+                    "telemetry throttle={} raw={} value={:?}",
+                    throttle_percent,
+                    raw_throttle,
+                    frame
+                );
+            }
+            Err(err) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
+                info!(
+                    "telemetry err throttle={} raw={} err={:?}",
+                    throttle_percent,
+                    raw_throttle,
+                    err
+                );
+            }
             _ => {}
         }
+
+        ticker.next().await;
     }
 }
 
@@ -78,45 +100,21 @@ async fn motor_task(
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
-    let pin_port = p.PA8.port() * 16 + p.PA8.pin();
-    let pin_bit = p.PA8.pin() as u32;
-    let idr_addr = unsafe { AnyPin::steal(pin_port).block().idr().as_ptr() as *mut u16 };
-
-    let cfg = BoardConfig {
-        // Update these resources to match your board's timer/DMA/pin mapping.
-        line: BidirLine::new(Flex::new(p.PA8), 1),
-        pin_bit,
-        idr_addr,
-        send_timer: Timer::new(p.TIM1),
-        send_dma: p.DMA2_CH5,
-        send_channel: TimerChannel::Ch1,
-        sample_timer: Timer::new(p.TIM2),
-        sample_dma: p.DMA1_CH1,
-    };
-
-    let controller = Stm32BidirController::new(Stm32BidirParts {
-        line: cfg.line,
-        tx_timer: cfg.send_timer,
-        tx_channel: cfg.send_channel,
-        tx_dma: cfg.send_dma,
-        tx_bitrate_hz: DSHOT_BITRATE_HZ,
-        rx_timer: cfg.sample_timer,
-        rx_dma: cfg.sample_dma,
-        rx_idr_addr: cfg.idr_addr,
-        rx_pin_bit: cfg.pin_bit,
-        rx_sample_hz: TELEMETRY_SAMPLE_HZ,
-        decode_cfg: BidirDecodeConfig::default(),
-    });
+    // Adjust timer/DMA/pin mapping here to match your board.
+    let tx_pin = DshotTxPin::new_ch1(p.PA8);
+    let rx_cfg = Stm32BidirCapture::new(p.TIM2, p.DMA1_CH1, OversamplingConfig::default());
+    let controller = unwrap!(Stm32BidirController::bidirectional(
+        p.TIM1,
+        tx_pin,
+        p.DMA2_CH5,
+        rx_cfg,
+        DshotSpeed::Dshot300,
+    ));
 
     let sender = MOTOR_THROTTLE.sender();
     sender.send(0);
-    let receiver = MOTOR_THROTTLE.receiver().unwrap();
+    let receiver = unwrap!(MOTOR_THROTTLE.receiver());
 
     spawner.must_spawn(motor_task(controller, receiver));
-
-    EmbassyTimer::after(Duration::from_millis(7000)).await;
-    info!("start loop");
-    loop {
-        EmbassyTimer::after(Duration::from_secs(3600)).await;
-    }
+    run_demo(&sender).await
 }
