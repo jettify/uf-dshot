@@ -3,26 +3,26 @@
 use core::marker::PhantomData;
 
 use embassy_stm32_hal::dma::{Transfer, TransferOptions};
-use embassy_stm32_hal::gpio::{AfType, AnyPin, Flex, OutputType, Pull, Speed};
+use embassy_stm32_hal::gpio::{AfType, Flex, OutputType, Pull, Speed};
+use embassy_stm32_hal::interrupt::typelevel::Binding;
 use embassy_stm32_hal::time::Hertz;
-use embassy_stm32_hal::timer::low_level::{OutputCompareMode, OutputPolarity, Timer};
+use embassy_stm32_hal::timer::input_capture::InputCapture;
+use embassy_stm32_hal::timer::low_level::{CountingMode, OutputCompareMode, OutputPolarity, Timer};
 use embassy_stm32_hal::timer::{
-    BasicInstance, BasicNoCr2Instance, Ch1, Ch2, Ch3, Ch4, Channel, GeneralInstance1Channel,
-    GeneralInstance4Channel, TimerChannel, TimerPin, UpDma,
+    CaptureCompareInterruptHandler, Ch1, Ch2, Ch3, Ch4, Channel, GeneralInstance4Channel,
+    TimerChannel, TimerPin, UpDma,
 };
 use embassy_stm32_hal::Peri;
-use embassy_time::{with_timeout, Duration, Timer as EmbassyTimer};
+use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
 use crate::command::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx, WaveformTiming};
 use crate::telemetry::{
-    BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
-    TelemetryPipelineError,
+    BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryFrame, TelemetryPipelineError,
 };
 
 const TX_BUFFER_SLOTS: usize = 17;
-const MAX_CAPTURE_SAMPLES: usize = 96;
-const PREAMBLE_MARGIN_SAMPLES: usize = 6;
-const DEFAULT_ARM_DURATION: Duration = Duration::from_secs(1);
+const MAX_CAPTURE_EDGES: usize = 32;
+const DEFAULT_ARM_DURATION: Duration = Duration::from_millis(3_000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -57,8 +57,6 @@ pub enum Stm32RuntimeError {
 pub struct DshotTxPin<'d, T: GeneralInstance4Channel> {
     line: Flex<'d>,
     af_num: u8,
-    pin_port: u8,
-    pin_index: u8,
     channel: Channel,
     _timer: PhantomData<T>,
 }
@@ -82,14 +80,10 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
 
     fn new<C: TimerChannel>(pin: Peri<'d, impl TimerPin<T, C>>, channel: Channel) -> Self {
         let af_num = pin.af_num();
-        let pin_index = pin.pin();
-        let pin_port = pin.port() * 16 + pin.pin();
 
         Self {
             line: Flex::new(pin),
             af_num,
-            pin_port,
-            pin_index,
             channel,
             _timer: PhantomData,
         }
@@ -97,10 +91,6 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
 
     pub fn channel(&self) -> Channel {
         self.channel
-    }
-
-    pub fn pin_index(&self) -> u8 {
-        self.pin_index
     }
 
     fn enter_tx(&mut self) {
@@ -114,46 +104,29 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
         self.line.set_as_input(pull);
     }
 
-    fn idr_addr(&self) -> *mut u32 {
-        // SAFETY: the controller owns this GPIO line for its full lifetime.
-        unsafe { AnyPin::steal(self.pin_port).block().idr().as_ptr() as *mut u32 }
+    fn enter_capture(&mut self, pull: Pull) {
+        self.line
+            .set_as_af_unchecked(self.af_num, AfType::input(pull));
     }
 }
 
-pub struct Stm32BidirCapture<'d, T, D>
-where
-    T: BasicInstance + BasicNoCr2Instance,
-    D: UpDma<T>,
-{
-    sample_timer: Peri<'d, T>,
-    sample_dma: Peri<'d, D>,
+pub struct Stm32BidirCapture {
     oversampling: OversamplingConfig,
     sample_count: usize,
-    decode_hint: DecodeHint,
     pull: Pull,
     preamble_tuning: PreambleTuningConfig,
     timeouts: RuntimeTimeouts,
 }
 
-impl<'d, T, D> Stm32BidirCapture<'d, T, D>
-where
-    T: BasicInstance + BasicNoCr2Instance,
-    D: UpDma<T>,
-{
-    pub fn new(
-        sample_timer: Peri<'d, T>,
-        sample_dma: Peri<'d, D>,
-        oversampling: OversamplingConfig,
-    ) -> Self {
-        let sample_count = oversampling.frame_bits as usize * oversampling.oversampling as usize
-            + PREAMBLE_MARGIN_SAMPLES;
+impl Stm32BidirCapture {
+    pub fn new(oversampling: OversamplingConfig) -> Self {
+        let sample_count = usize::from(oversampling.frame_bits)
+            .saturating_add(1)
+            .min(MAX_CAPTURE_EDGES);
 
         Self {
-            sample_timer,
-            sample_dma,
             oversampling,
             sample_count,
-            decode_hint: DecodeHint::default(),
             pull: Pull::Up,
             preamble_tuning: PreambleTuningConfig::default(),
             timeouts: RuntimeTimeouts::default(),
@@ -162,11 +135,6 @@ where
 
     pub fn with_sample_count(mut self, sample_count: usize) -> Self {
         self.sample_count = sample_count;
-        self
-    }
-
-    pub fn with_decode_hint(mut self, hint: DecodeHint) -> Self {
-        self.decode_hint = hint;
         self
     }
 
@@ -194,8 +162,11 @@ where
     timer: Timer<'d, T>,
     tx_pin: DshotTxPin<'d, T>,
     tx_dma: Peri<'d, D>,
+    speed: DshotSpeed,
     waveform_timing: WaveformTiming,
     timeouts: RuntimeTimeouts,
+    release_pull: Option<Pull>,
+    line_in_tx_mode: bool,
     duty_buffer: [u16; TX_BUFFER_SLOTS],
 }
 
@@ -206,12 +177,14 @@ where
 {
     fn new(
         timer: Peri<'d, T>,
-        tx_pin: DshotTxPin<'d, T>,
+        mut tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
         speed: DshotSpeed,
+        output_polarity: OutputPolarity,
     ) -> Self {
         let timer = Timer::new(timer);
-        let period_ticks = setup_dshot_timer(&timer, tx_pin.channel(), speed);
+        tx_pin.enter_tx();
+        let period_ticks = setup_dshot_timer(&timer, tx_pin.channel(), speed, output_polarity);
         let waveform_timing = WaveformTiming {
             period_ticks,
             bit0_high_ticks: (period_ticks * 3) / 8,
@@ -222,8 +195,11 @@ where
             timer,
             tx_pin,
             tx_dma,
+            speed,
             waveform_timing,
             timeouts: RuntimeTimeouts::default(),
+            release_pull: None,
+            line_in_tx_mode: true,
             duty_buffer: [0; TX_BUFFER_SLOTS],
         }
     }
@@ -233,112 +209,206 @@ where
         self
     }
 
+    fn with_release_pull(mut self, pull: Pull) -> Self {
+        self.release_pull = Some(pull);
+        self
+    }
+
+    fn prepare_for_tx(&mut self) {
+        if !self.line_in_tx_mode {
+            self.tx_pin.enter_tx();
+            self.line_in_tx_mode = true;
+        }
+        let channel = self.tx_pin.channel();
+        self.timer.set_compare_value(channel, 0);
+        self.timer.enable_outputs();
+        self.timer.enable_channel(channel, true);
+    }
+
+    fn recover_from_tx_timeout(&mut self) {
+        let channel = self.tx_pin.channel();
+
+        self.timer.enable_update_dma(false);
+        self.timer.stop();
+        self.timer.set_compare_value(channel, 0);
+        self.timer.enable_channel(channel, false);
+
+        if let Some(pull) = self.release_pull {
+            self.tx_pin.enter_rx_pullup(pull);
+            self.line_in_tx_mode = false;
+        }
+    }
+
+    fn release_line_to_idle(&mut self) {
+        if let Some(pull) = self.release_pull {
+            self.tx_pin.enter_rx_pullup(pull);
+            self.line_in_tx_mode = false;
+        }
+    }
+
     async fn send_encoded(
         &mut self,
         frame: EncodedFrame,
+    ) -> Result<EncodedFrame, Stm32RuntimeError> {
+        self.send_encoded_with_release(frame, true).await
+    }
+
+    async fn send_encoded_with_release(
+        &mut self,
+        frame: EncodedFrame,
+        release_after_send: bool,
     ) -> Result<EncodedFrame, Stm32RuntimeError> {
         let waveform = frame.to_waveform_ticks(self.waveform_timing, true);
         self.duty_buffer[..16].copy_from_slice(&waveform.bit_high_ticks);
         self.duty_buffer[16] = waveform.reset_low_ticks.unwrap_or(0);
 
-        self.tx_pin.enter_tx();
-        match with_timeout(
-            self.timeouts.tx,
-            send_waveform(
-                &self.timer,
-                self.tx_pin.channel(),
-                self.tx_dma.reborrow(),
-                &self.duty_buffer,
-            ),
-        )
-        .await
-        {
-            Ok(()) => Ok(frame),
-            Err(_) => Err(Stm32RuntimeError::TxTimeout),
+        self.prepare_for_tx();
+        let original_update_dma_state = self.timer.get_update_dma_state();
+        if !original_update_dma_state {
+            self.timer.enable_update_dma(true);
+        }
+
+        let req = self.tx_dma.request();
+        let ccr = self
+            .timer
+            .regs_1ch()
+            .ccr(self.tx_pin.channel().index())
+            .as_ptr() as *mut u16;
+        let mut options = TransferOptions::default();
+        options.fifo_threshold = Some(embassy_stm32_hal::dma::FifoThreshold::Full);
+        options.mburst = embassy_stm32_hal::dma::Burst::Incr8;
+
+        // SAFETY: DMA writes the provided waveform buffer into the timer CCR register while
+        // both the timer peripheral and the buffer remain alive for the transfer duration.
+        let tx_result = unsafe {
+            with_timeout(
+                self.timeouts.tx,
+                Transfer::new_write(self.tx_dma.reborrow(), req, &self.duty_buffer, ccr, options),
+            )
+            .await
+        };
+
+        if !original_update_dma_state {
+            self.timer.enable_update_dma(false);
+        }
+
+        match tx_result {
+            Ok(()) => {
+                if release_after_send {
+                    if self.release_pull.is_some() {
+                        // DMA completion only means the trailing CCR=0 reset slot was loaded into
+                        // the timer. Wait one bit period so the timer can finish driving that low
+                        // interval on the wire before the line is released for telemetry.
+                        EmbassyTimer::after(Duration::from_hz(
+                            self.speed.timing_hints().nominal_bitrate_hz as u64,
+                        ))
+                        .await;
+                    }
+
+                    self.release_line_to_idle();
+                }
+
+                Ok(frame)
+            }
+            Err(_) => {
+                self.recover_from_tx_timeout();
+                Err(Stm32RuntimeError::TxTimeout)
+            }
         }
     }
 }
 
-struct RxBackend<'d, T, D>
+struct RxBackend<'d, T>
 where
-    T: BasicInstance + BasicNoCr2Instance,
-    D: UpDma<T>,
+    T: GeneralInstance4Channel,
 {
-    sample_timer: Timer<'d, T>,
-    sample_dma: Peri<'d, D>,
+    input_capture: InputCapture<'d, T>,
     decoder: BidirDecoder,
     sample_count: usize,
-    decode_hint: DecodeHint,
     pull: Pull,
     timeouts: RuntimeTimeouts,
-    raw_samples: [u32; MAX_CAPTURE_SAMPLES],
-    sample_words: [u16; MAX_CAPTURE_SAMPLES],
+    capture_buffer: [u32; MAX_CAPTURE_EDGES],
 }
 
-impl<'d, T, D> RxBackend<'d, T, D>
+impl<'d, T> RxBackend<'d, T>
 where
-    T: BasicInstance + BasicNoCr2Instance,
-    D: UpDma<T>,
+    T: GeneralInstance4Channel,
 {
-    fn new(cfg: Stm32BidirCapture<'d, T, D>) -> Result<Self, Stm32ConfigError> {
-        if cfg.sample_count == 0 || cfg.sample_count > MAX_CAPTURE_SAMPLES {
+    fn new(
+        timer: Peri<'d, T>,
+        cfg: Stm32BidirCapture,
+        irq: impl Binding<T::CaptureCompareInterrupt, CaptureCompareInterruptHandler<T>> + 'd,
+        speed: DshotSpeed,
+    ) -> Result<Self, Stm32ConfigError> {
+        if cfg.sample_count == 0 || cfg.sample_count > MAX_CAPTURE_EDGES {
             return Err(Stm32ConfigError::SampleBufferTooSmall {
                 requested: cfg.sample_count,
-                capacity: MAX_CAPTURE_SAMPLES,
+                capacity: MAX_CAPTURE_EDGES,
             });
         }
 
+        let decoder = BidirDecoder::with_preamble_tuning(cfg.oversampling, cfg.preamble_tuning);
+        let sample_hz =
+            speed.timing_hints().nominal_bitrate_hz * cfg.oversampling.oversampling as u32;
+
         Ok(Self {
-            sample_timer: Timer::new(cfg.sample_timer),
-            sample_dma: cfg.sample_dma,
-            decoder: BidirDecoder::with_preamble_tuning(cfg.oversampling, cfg.preamble_tuning),
+            input_capture: InputCapture::new(
+                timer,
+                None,
+                None,
+                None,
+                None,
+                irq,
+                Hertz(sample_hz),
+                CountingMode::EdgeAlignedUp,
+            ),
+            decoder,
             sample_count: cfg.sample_count,
-            decode_hint: cfg.decode_hint,
             pull: cfg.pull,
             timeouts: cfg.timeouts,
-            raw_samples: [0; MAX_CAPTURE_SAMPLES],
-            sample_words: [0; MAX_CAPTURE_SAMPLES],
+            capture_buffer: [0; MAX_CAPTURE_EDGES],
         })
     }
 
-    async fn capture<TX>(
+    async fn capture(
         &mut self,
-        tx_pin: &mut DshotTxPin<'_, TX>,
+        tx_pin: &mut DshotTxPin<'_, T>,
         speed: DshotSpeed,
-    ) -> Result<TelemetryFrame, Stm32RuntimeError>
-    where
-        TX: GeneralInstance4Channel,
-    {
-        tx_pin.enter_rx_pullup(self.pull);
-        let sample_hz =
-            speed.timing_hints().nominal_bitrate_hz * self.decoder.cfg.oversampling as u32;
-        let slice = &mut self.raw_samples[..self.sample_count];
+    ) -> Result<TelemetryFrame, Stm32RuntimeError> {
+        tx_pin.enter_capture(self.pull);
+        let channel = tx_pin.channel();
+        let captures = &mut self.capture_buffer[..self.sample_count];
+        let mut captured = 0usize;
 
-        match with_timeout(
+        let first_edge = with_timeout(
             self.timeouts.rx,
-            capture_port_samples(
-                &self.sample_timer,
-                self.sample_dma.reborrow(),
-                tx_pin.idr_addr(),
-                sample_hz,
-                slice,
-            ),
+            self.input_capture.wait_for_any_edge(channel),
         )
         .await
-        {
-            Ok(()) => {}
-            Err(_) => return Err(Stm32RuntimeError::RxTimeout),
+        .map_err(|_| Stm32RuntimeError::RxTimeout)?;
+        captures[captured] = first_edge;
+        captured += 1;
+
+        let inter_edge_timeout =
+            Duration::from_micros(speed.timing_hints().min_frame_period_us as u64);
+        while captured < captures.len() {
+            match with_timeout(
+                inter_edge_timeout,
+                self.input_capture.wait_for_any_edge(channel),
+            )
+            .await
+            {
+                Ok(ts) => {
+                    captures[captured] = ts;
+                    captured += 1;
+                }
+                Err(_) => break,
+            }
         }
 
-        for (dst, src) in self.sample_words[..self.sample_count]
-            .iter_mut()
-            .zip(slice.iter())
-        {
-            *dst = *src as u16;
-        }
-
+        tx_pin.enter_rx_pullup(self.pull);
         self.decoder
-            .decode_frame(&self.sample_words[..self.sample_count], self.decode_hint)
+            .decode_capture_frame_with_ticks(&captures[..captured], 1)
             .map_err(Stm32RuntimeError::Telemetry)
     }
 }
@@ -364,7 +434,7 @@ where
         speed: DshotSpeed,
     ) -> Self {
         Self {
-            tx: TxBackend::new(timer, tx_pin, tx_dma, speed),
+            tx: TxBackend::new(timer, tx_pin, tx_dma, speed, OutputPolarity::ActiveHigh),
             speed,
         }
     }
@@ -379,7 +449,7 @@ where
             &mut self.tx,
             self.speed,
             duration,
-            UniTx::throttle_clamped(0).encode(),
+            UniTx::command(Command::MotorStop).encode(),
         )
         .await
     }
@@ -392,15 +462,16 @@ where
         &mut self,
         throttle: u16,
     ) -> Result<EncodedFrame, Stm32RuntimeError> {
-        self.send_frame(UniTx::throttle_clamped(throttle).encode())
-            .await
+        let t = UniTx::throttle_clamped(throttle).encode();
+        self.send_frame(t).await
     }
 
     pub async fn send_command(
         &mut self,
         command: Command,
     ) -> Result<EncodedFrame, Stm32RuntimeError> {
-        send_command_with_policy(&mut self.tx, UniTx::command(command).encode(), command).await
+        let frame = UniTx::command(command).encode();
+        send_command_with_policy(&mut self.tx, frame, command).await
     }
 
     pub async fn send_frame(
@@ -411,37 +482,37 @@ where
     }
 }
 
-pub struct Stm32BidirController<'d, TXT, TXD, RXT, RXD>
+pub struct Stm32BidirController<'d, T, D>
 where
-    TXT: GeneralInstance4Channel,
-    TXD: UpDma<TXT>,
-    RXT: BasicInstance + BasicNoCr2Instance,
-    RXD: UpDma<RXT>,
+    T: GeneralInstance4Channel,
+    D: UpDma<T>,
 {
-    tx: TxBackend<'d, TXT, TXD>,
-    rx: RxBackend<'d, RXT, RXD>,
+    tx: TxBackend<'d, T, D>,
+    rx: RxBackend<'d, T>,
     speed: DshotSpeed,
 }
 
-impl<'d, TXT, TXD, RXT, RXD> Stm32BidirController<'d, TXT, TXD, RXT, RXD>
+impl<'d, T, D> Stm32BidirController<'d, T, D>
 where
-    TXT: GeneralInstance4Channel,
-    TXD: UpDma<TXT>,
-    RXT: BasicInstance + BasicNoCr2Instance,
-    RXD: UpDma<RXT>,
+    T: GeneralInstance4Channel,
+    D: UpDma<T>,
 {
     pub fn bidirectional(
-        timer: Peri<'d, TXT>,
-        tx_pin: DshotTxPin<'d, TXT>,
-        tx_dma: Peri<'d, TXD>,
-        mut rx_cfg: Stm32BidirCapture<'d, RXT, RXD>,
+        timer: Peri<'d, T>,
+        tx_pin: DshotTxPin<'d, T>,
+        tx_dma: Peri<'d, D>,
+        rx_cfg: Stm32BidirCapture,
+        irq: impl Binding<T::CaptureCompareInterrupt, CaptureCompareInterruptHandler<T>> + 'd,
         speed: DshotSpeed,
     ) -> Result<Self, Stm32ConfigError> {
-        rx_cfg.oversampling.sample_bit_index = tx_pin.pin_index();
+        // SAFETY: TX and RX use the same hardware timer sequentially under one controller.
+        let rx_timer = unsafe { timer.clone_unchecked() };
 
         Ok(Self {
-            tx: TxBackend::new(timer, tx_pin, tx_dma, speed).with_timeouts(rx_cfg.timeouts),
-            rx: RxBackend::new(rx_cfg)?,
+            tx: TxBackend::new(timer, tx_pin, tx_dma, speed, OutputPolarity::ActiveLow)
+                .with_timeouts(rx_cfg.timeouts)
+                .with_release_pull(rx_cfg.pull),
+            rx: RxBackend::new(rx_timer, rx_cfg, irq, speed)?,
             speed,
         })
     }
@@ -451,7 +522,7 @@ where
             &mut self.tx,
             self.speed,
             duration,
-            BidirTx::throttle_clamped(0).encode(),
+            BidirTx::command(Command::MotorStop).encode(),
         )
         .await
     }
@@ -496,11 +567,12 @@ fn setup_dshot_timer<T: GeneralInstance4Channel>(
     timer: &Timer<'_, T>,
     channel: Channel,
     speed: DshotSpeed,
+    output_polarity: OutputPolarity,
 ) -> u16 {
     timer.stop();
     timer.set_output_compare_mode(channel, OutputCompareMode::PwmMode1);
     timer.set_output_compare_preload(channel, true);
-    timer.set_output_polarity(channel, OutputPolarity::ActiveHigh);
+    timer.set_output_polarity(channel, output_polarity);
     timer.enable_channel(channel, true);
     timer.set_frequency(Hertz(speed.timing_hints().nominal_bitrate_hz));
     timer.set_compare_value(channel, 0);
@@ -508,60 +580,6 @@ fn setup_dshot_timer<T: GeneralInstance4Channel>(
     timer.start();
 
     (timer.get_max_compare_value() as u16).saturating_add(1)
-}
-
-async fn send_waveform<T, D>(timer: &Timer<'_, T>, channel: Channel, dma: Peri<'_, D>, duty: &[u16])
-where
-    T: GeneralInstance1Channel + BasicNoCr2Instance + BasicInstance,
-    D: UpDma<T>,
-{
-    let original_update_dma_state = timer.get_update_dma_state();
-    if !original_update_dma_state {
-        timer.enable_update_dma(true);
-    }
-
-    let req = dma.request();
-    let ccr = timer.regs_1ch().ccr(channel.index()).as_ptr() as *mut u16;
-    let mut options = TransferOptions::default();
-    options.fifo_threshold = Some(embassy_stm32_hal::dma::FifoThreshold::Full);
-    options.mburst = embassy_stm32_hal::dma::Burst::Incr8;
-
-    // SAFETY: DMA writes the provided waveform buffer into the timer CCR register while
-    // both the timer peripheral and the buffer remain alive for the transfer duration.
-    unsafe {
-        Transfer::new_write(dma, req, duty, ccr, options).await;
-    }
-
-    if !original_update_dma_state {
-        timer.enable_update_dma(false);
-    }
-}
-
-async fn capture_port_samples<T, D>(
-    timer: &Timer<'_, T>,
-    dma: Peri<'_, D>,
-    idr_addr: *mut u32,
-    sample_hz: u32,
-    buffer: &mut [u32],
-) where
-    T: BasicInstance + BasicNoCr2Instance,
-    D: UpDma<T>,
-{
-    timer.stop();
-    timer.set_frequency(Hertz(sample_hz));
-    timer.enable_update_dma(true);
-    timer.start();
-
-    let req = dma.request();
-    let options = TransferOptions::default();
-
-    // SAFETY: DMA reads a fixed GPIO IDR register into an exclusive caller-owned sample buffer.
-    unsafe {
-        Transfer::new_read(dma, req, idr_addr, buffer, options).await;
-    }
-
-    timer.stop();
-    timer.enable_update_dma(false);
 }
 
 async fn send_command_with_policy<T, D>(
@@ -599,17 +617,28 @@ where
     D: UpDma<T>,
 {
     let frame_period = Duration::from_micros(speed.timing_hints().min_frame_period_us as u64);
-    let total_us = duration.as_micros() as u64;
-    let frame_period_us = frame_period.as_micros() as u64;
-    let frames = if total_us == 0 {
-        0
-    } else {
-        total_us.div_ceil(frame_period_us)
-    };
+    let start = Instant::now();
+    let deadline = start + duration;
+    let mut next_frame_at = start;
 
-    for _ in 0..frames {
-        tx.send_encoded(frame).await?;
-        EmbassyTimer::after(frame_period).await;
+    while Instant::now() < deadline {
+        tx.send_encoded_with_release(frame, false).await?;
+        next_frame_at += frame_period;
+
+        let now = Instant::now();
+        if next_frame_at > now {
+            EmbassyTimer::at(next_frame_at).await;
+        } else {
+            next_frame_at = now;
+        }
+    }
+
+    if tx.release_pull.is_some() {
+        EmbassyTimer::after(Duration::from_hz(
+            speed.timing_hints().nominal_bitrate_hz as u64,
+        ))
+        .await;
+        tx.release_line_to_idle();
     }
 
     Ok(())

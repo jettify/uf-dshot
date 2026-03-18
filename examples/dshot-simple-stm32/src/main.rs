@@ -10,7 +10,7 @@ use embassy_time::{Duration, Ticker};
 use panic_halt as _;
 
 use uf_dshot::embassy_stm32::{DshotTxPin, Stm32DshotController};
-use uf_dshot::DshotSpeed;
+use uf_dshot::{Command, DshotSpeed};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
@@ -24,11 +24,10 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let tx_pin = DshotTxPin::new_ch1(p.PA8);
     let mut esc = Stm32DshotController::tx_only(p.TIM1, tx_pin, p.DMA2_CH5, ESC_SPEED);
     let tx_period_us = u64::from(ESC_SPEED.timing_hints().min_frame_period_us);
-
-    info!("arming");
+    let mut ticker = Ticker::every(Duration::from_micros(tx_period_us));
+    info!("start arm");
     unwrap!(esc.arm().await);
 
-    let mut ticker = Ticker::every(Duration::from_micros(tx_period_us));
     info!("spinning at throttle {}", DEMO_THROTTLE);
     loop {
         unwrap!(esc.send_throttle(DEMO_THROTTLE).await);
