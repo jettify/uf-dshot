@@ -12,7 +12,9 @@ use embassy_time::{Duration, Ticker, Timer as EmbassyTimer};
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use uf_dshot::embassy_stm32::{DshotTxPin, Stm32BidirCapture, Stm32BidirController};
+use uf_dshot::embassy_stm32::{
+    DshotTxPin, RuntimeTimeouts, Stm32BidirCapture, Stm32BidirController,
+};
 use uf_dshot::{DshotSpeed, OversamplingConfig};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
@@ -102,7 +104,11 @@ async fn main(spawner: Spawner) {
 
     // Adjust timer/DMA/pin mapping here to match your board.
     let tx_pin = DshotTxPin::new_ch1(p.PA8);
-    let rx_cfg = Stm32BidirCapture::new(p.TIM2, p.DMA1_CH1, OversamplingConfig::default());
+    let rx_cfg = Stm32BidirCapture::new(p.TIM2, p.DMA1_CH1, OversamplingConfig::default())
+        .with_timeouts(RuntimeTimeouts {
+            tx: Duration::from_millis(2),
+            rx: Duration::from_micros(100),
+        });
     let controller = unwrap!(Stm32BidirController::bidirectional(
         p.TIM1,
         tx_pin,

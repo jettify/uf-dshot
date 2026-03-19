@@ -52,12 +52,12 @@ fn setup_dshot_timer<T: AdvancedInstance4Channel>(
     timer.enable_channel(channel, true);
 
     timer.set_frequency(Hertz(bitrate_hz));
-    timer.set_compare_value(channel, 0);
+    timer.set_compare_value(channel, 0.into());
     timer.enable_outputs();
     timer.set_moe(true);
     timer.start();
 
-    (timer.get_max_compare_value() as u16).saturating_add(1)
+    (timer.get_max_compare_value().into() as u16).saturating_add(1)
 }
 
 async fn send_waveform<T: GeneralInstance1Channel + BasicNoCr2Instance + BasicInstance>(
@@ -165,14 +165,7 @@ async fn motor_task(
         if frames_sent % TX_LOG_EVERY_FRAMES == 0 {
             info!(
                 "tx throttle={} payload=0x{:04X} crc=0x{:X} hi=[{},{},{},{}] arming={}",
-                commanded,
-                payload,
-                crc,
-                cycles[0],
-                cycles[1],
-                cycles[2],
-                cycles[3],
-                arming
+                commanded, payload, crc, cycles[0], cycles[1], cycles[2], cycles[3], arming
             );
         }
 

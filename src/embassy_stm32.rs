@@ -7,11 +7,11 @@ use embassy_stm32_hal::gpio::{AfType, AnyPin, Flex, OutputType, Pull, Speed};
 use embassy_stm32_hal::time::Hertz;
 use embassy_stm32_hal::timer::low_level::{OutputCompareMode, OutputPolarity, Timer};
 use embassy_stm32_hal::timer::{
-    BasicInstance, BasicNoCr2Instance, Ch1, Ch2, Ch3, Ch4, Channel, GeneralInstance1Channel,
-    GeneralInstance4Channel, TimerChannel, TimerPin, UpDma,
+    BasicInstance, BasicNoCr2Instance, Ch1, Ch2, Ch3, Ch4, Channel, GeneralInstance4Channel,
+    TimerChannel, TimerPin, UpDma,
 };
 use embassy_stm32_hal::Peri;
-use embassy_time::{with_timeout, Duration, Timer as EmbassyTimer};
+use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
 use crate::command::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx, WaveformTiming};
 use crate::telemetry::{
@@ -310,6 +310,9 @@ where
         TX: GeneralInstance4Channel,
     {
         tx_pin.enter_rx_pullup(self.pull);
+        // DMA completion only guarantees the last CCR value was written; wait one nominal
+        // bit period so the trailing reset-low slot can finish before sampling the line.
+        EmbassyTimer::after(bit_period_duration(speed)).await;
         let sample_hz =
             speed.timing_hints().nominal_bitrate_hz * self.decoder.cfg.oversampling as u32;
         let slice = &mut self.raw_samples[..self.sample_count];
@@ -326,7 +329,8 @@ where
         )
         .await
         {
-            Ok(()) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
             Err(_) => return Err(Stm32RuntimeError::RxTimeout),
         }
 
@@ -451,7 +455,7 @@ where
             &mut self.tx,
             self.speed,
             duration,
-            BidirTx::throttle_clamped(0).encode(),
+            BidirTx::command(Command::MotorStop).encode(),
         )
         .await
     }
@@ -503,16 +507,16 @@ fn setup_dshot_timer<T: GeneralInstance4Channel>(
     timer.set_output_polarity(channel, OutputPolarity::ActiveHigh);
     timer.enable_channel(channel, true);
     timer.set_frequency(Hertz(speed.timing_hints().nominal_bitrate_hz));
-    timer.set_compare_value(channel, 0);
+    timer.set_compare_value(channel, 0.into());
     timer.enable_outputs();
     timer.start();
 
-    (timer.get_max_compare_value() as u16).saturating_add(1)
+    (timer.get_max_compare_value().into() as u16).saturating_add(1)
 }
 
 async fn send_waveform<T, D>(timer: &Timer<'_, T>, channel: Channel, dma: Peri<'_, D>, duty: &[u16])
 where
-    T: GeneralInstance1Channel + BasicNoCr2Instance + BasicInstance,
+    T: GeneralInstance4Channel + BasicNoCr2Instance + BasicInstance,
     D: UpDma<T>,
 {
     let original_update_dma_state = timer.get_update_dma_state();
@@ -521,10 +525,8 @@ where
     }
 
     let req = dma.request();
-    let ccr = timer.regs_1ch().ccr(channel.index()).as_ptr() as *mut u16;
-    let mut options = TransferOptions::default();
-    options.fifo_threshold = Some(embassy_stm32_hal::dma::FifoThreshold::Full);
-    options.mburst = embassy_stm32_hal::dma::Burst::Incr8;
+    let ccr = timer.regs_gp16().ccr(channel.index()).as_ptr() as *mut u16;
+    let options = TransferOptions::default();
 
     // SAFETY: DMA writes the provided waveform buffer into the timer CCR register while
     // both the timer peripheral and the buffer remain alive for the transfer duration.
@@ -537,31 +539,49 @@ where
     }
 }
 
+fn bit_period_duration(speed: DshotSpeed) -> Duration {
+    let bitrate_hz = u64::from(speed.timing_hints().nominal_bitrate_hz);
+    Duration::from_micros(1_000_000_u64.div_ceil(bitrate_hz))
+}
+
 async fn capture_port_samples<T, D>(
     timer: &Timer<'_, T>,
     dma: Peri<'_, D>,
     idr_addr: *mut u32,
     sample_hz: u32,
     buffer: &mut [u32],
-) where
+) -> Result<(), Stm32RuntimeError>
+where
     T: BasicInstance + BasicNoCr2Instance,
     D: UpDma<T>,
 {
+    let _ = dma;
     timer.stop();
     timer.set_frequency(Hertz(sample_hz));
-    timer.enable_update_dma(true);
+    timer.clear_update_interrupt();
     timer.start();
 
-    let req = dma.request();
-    let options = TransferOptions::default();
+    let sample_period_us = 1_000_000_u64.div_ceil(u64::from(sample_hz));
+    let capture_budget_us = sample_period_us
+        .saturating_mul(buffer.len() as u64)
+        .saturating_add(sample_period_us.saturating_mul(4));
+    let deadline = Instant::now() + Duration::from_micros(capture_budget_us);
 
-    // SAFETY: DMA reads a fixed GPIO IDR register into an exclusive caller-owned sample buffer.
-    unsafe {
-        Transfer::new_read(dma, req, idr_addr, buffer, options).await;
+    for sample in buffer.iter_mut() {
+        while !timer.clear_update_interrupt() {
+            if Instant::now() >= deadline {
+                timer.stop();
+                return Err(Stm32RuntimeError::RxTimeout);
+            }
+            core::hint::spin_loop();
+        }
+
+        // SAFETY: reads a fixed GPIO IDR register while the controller owns the line.
+        *sample = unsafe { core::ptr::read_volatile(idr_addr) };
     }
 
     timer.stop();
-    timer.enable_update_dma(false);
+    Ok(())
 }
 
 async fn send_command_with_policy<T, D>(
