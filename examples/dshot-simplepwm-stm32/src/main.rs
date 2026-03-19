@@ -17,16 +17,24 @@ use embassy_time::{Duration, Ticker, Timer as EmbassyTimer};
 use fmt::info;
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
-use uf_dshot::{DshotSpeed, UniTx, WaveformTiming};
+use uf_dshot::{Command, DshotSpeed, UniTx, WaveformTiming};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
-static MOTOR_THROTTLE: Watch<ThreadModeRawMutex, u16, 1> = Watch::new_with(0);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MotorRequest {
+    Stop,
+    ThrottlePercent(u16),
+}
+
+static MOTOR_REQUEST: Watch<ThreadModeRawMutex, MotorRequest, 1> =
+    Watch::new_with(MotorRequest::Stop);
 
 const DEMO_SPEED: DshotSpeed = DshotSpeed::Dshot300;
 const TX_PERIOD_US: u64 = 70;
-const ARMING_DELAY_MS: u64 = 7_000;
-const DEMO_THROTTLE_MAX_PERCENT: u16 = 25;
+const ARMING_DELAY_MS: u64 = 2_000;
+const STARTUP_MOTOR_STOP_MS: u64 = 1_000;
+const DEMO_THROTTLE_MAX_PERCENT: u16 = 10;
 const DSHOT_MAX_THROTTLE: u16 = 1_999;
 const TX_LOG_EVERY_FRAMES: u32 = 20_000;
 
@@ -43,29 +51,53 @@ fn dshot_waveform_timing(max_duty: u16) -> WaveformTiming {
     }
 }
 
-fn make_cycles(raw_throttle: u16, timing: WaveformTiming) -> [u16; 17] {
-    let frame = UniTx::throttle_clamped(raw_throttle).encode();
+fn make_motor_stop_cycles(timing: WaveformTiming) -> [u16; 17] {
+    let frame = UniTx::command(Command::MotorStop).encode();
+    make_frame_cycles(frame, timing)
+}
+
+fn make_frame_cycles(frame: uf_dshot::EncodedFrame, timing: WaveformTiming) -> [u16; 17] {
     let waveform = frame.to_waveform_ticks(timing, false);
     let mut cycles = [0u16; 17];
     cycles[..16].copy_from_slice(&waveform.bit_high_ticks);
     cycles
 }
 
-async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
+fn write_frame_cycles(
+    cycles: &mut [u16; 17],
+    frame: uf_dshot::EncodedFrame,
+    timing: WaveformTiming,
+) {
+    let waveform = frame.to_waveform_ticks(timing, false);
+    cycles[..16].copy_from_slice(&waveform.bit_high_ticks);
+    cycles[16] = 0;
+}
+
+async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, MotorRequest, 1>) -> ! {
     EmbassyTimer::after(Duration::from_millis(ARMING_DELAY_MS)).await;
     info!("start loop");
 
     loop {
-        for value in 0..=DEMO_THROTTLE_MAX_PERCENT {
-            sender.send(value);
+        sender.send(MotorRequest::ThrottlePercent(1));
+        info!("dshot 1pct");
+        EmbassyTimer::after(Duration::from_secs(1)).await;
+
+        for value in 1..=DEMO_THROTTLE_MAX_PERCENT {
+            sender.send(MotorRequest::ThrottlePercent(value));
             info!("dshot up {}", value);
             EmbassyTimer::after(Duration::from_secs(1)).await;
         }
-        for value in (0..=DEMO_THROTTLE_MAX_PERCENT).rev() {
-            sender.send(value);
+
+        for value in (1..=DEMO_THROTTLE_MAX_PERCENT).rev() {
+            sender.send(MotorRequest::ThrottlePercent(value));
             info!("dshot down {}", value);
             EmbassyTimer::after(Duration::from_secs(1)).await;
         }
+
+        sender.send(MotorRequest::Stop);
+        sender.send(MotorRequest::ThrottlePercent(1));
+        info!("dshot 1pct");
+        EmbassyTimer::after(Duration::from_secs(1)).await;
     }
 }
 
@@ -73,7 +105,7 @@ async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
 async fn motor_task(
     mut pwm: SimplePwm<'static, embassy_stm32::peripherals::TIM1>,
     mut dma_ch: Peri<'static, DMA2_CH5>,
-    mut receiver: Receiver<'static, ThreadModeRawMutex, u16, 1>,
+    mut receiver: Receiver<'static, ThreadModeRawMutex, MotorRequest, 1>,
 ) -> ! {
     let max_duty = pwm.max_duty_cycle();
     let timing = dshot_waveform_timing(max_duty);
@@ -81,31 +113,51 @@ async fn motor_task(
     ch1.enable();
     ch1.set_duty_cycle_fully_off();
 
-    let cycles = make_cycles(0, timing);
-    pwm.waveform_up(dma_ch.reborrow(), Channel::Ch1, &cycles)
-        .await;
-
-    info!("Armed");
-
     let mut ticker = Ticker::every(Duration::from_micros(TX_PERIOD_US));
-    let mut throttle_percent = 0u16;
+    let motor_stop_cycles = make_motor_stop_cycles(timing);
+    let startup_deadline =
+        embassy_time::Instant::now() + Duration::from_millis(STARTUP_MOTOR_STOP_MS);
+
+    info!("streaming MotorStop for {} ms", STARTUP_MOTOR_STOP_MS);
+    while embassy_time::Instant::now() < startup_deadline {
+        pwm.waveform_up(dma_ch.reborrow(), Channel::Ch1, &motor_stop_cycles)
+            .await;
+        ticker.next().await;
+    }
+
+    info!("MotorStop startup complete");
+
+    let mut request = MotorRequest::Stop;
     let mut frames_sent = 0u32;
+    let mut throttle_cycles = [0u16; 17];
 
     loop {
         frames_sent = frames_sent.wrapping_add(1);
-        throttle_percent = receiver.try_get().unwrap_or(throttle_percent);
-        let raw_throttle = throttle_percent_to_raw(throttle_percent);
-        let cycles = make_cycles(raw_throttle, timing);
-        pwm.waveform_up(dma_ch.reborrow(), Channel::Ch1, &cycles)
+        request = receiver.try_get().unwrap_or(request);
+        let (cycles, throttle_percent, raw_throttle, payload) = match request {
+            MotorRequest::Stop => {
+                let frame = UniTx::command(Command::MotorStop).encode();
+                (&motor_stop_cycles, 0, 0, frame.payload)
+            }
+            MotorRequest::ThrottlePercent(throttle_percent) => {
+                let raw_throttle = throttle_percent_to_raw(throttle_percent);
+                let frame = UniTx::throttle_clamped(raw_throttle).encode();
+                write_frame_cycles(&mut throttle_cycles, frame, timing);
+                (
+                    &throttle_cycles,
+                    throttle_percent,
+                    raw_throttle,
+                    frame.payload,
+                )
+            }
+        };
+        pwm.waveform_up(dma_ch.reborrow(), Channel::Ch1, cycles)
             .await;
 
         if frames_sent % TX_LOG_EVERY_FRAMES == 0 {
-            let frame = UniTx::throttle_clamped(raw_throttle).encode();
             info!(
                 "tx throttle={} raw={} payload=0x{:04X}",
-                throttle_percent,
-                raw_throttle,
-                frame.payload
+                throttle_percent, raw_throttle, payload
             );
         }
 
@@ -131,9 +183,9 @@ async fn main(spawner: Spawner) {
     );
     let dma_ch = p.DMA2_CH5;
 
-    let sender = MOTOR_THROTTLE.sender();
-    sender.send(0);
-    let receiver = MOTOR_THROTTLE.receiver().unwrap();
+    let sender = MOTOR_REQUEST.sender();
+    sender.send(MotorRequest::Stop);
+    let receiver = MOTOR_REQUEST.receiver().unwrap();
 
     spawner.must_spawn(motor_task(pwm, dma_ch, receiver));
     led.set_high();

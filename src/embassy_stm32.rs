@@ -22,7 +22,7 @@ use crate::telemetry::{
 const TX_BUFFER_SLOTS: usize = 17;
 const MAX_CAPTURE_SAMPLES: usize = 96;
 const PREAMBLE_MARGIN_SAMPLES: usize = 6;
-const DEFAULT_ARM_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_ARM_DURATION: Duration = Duration::from_millis(3_000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -379,7 +379,7 @@ where
             &mut self.tx,
             self.speed,
             duration,
-            UniTx::throttle_clamped(0).encode(),
+            UniTx::command(Command::MotorStop).encode(),
         )
         .await
     }
