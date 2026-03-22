@@ -351,7 +351,8 @@ impl BidirDecoder {
         let mut cfg = self.cfg;
         cfg.oversampling = ticks_per_bit;
 
-        let gcr = decode_gcr_from_captures_cfg(captures, cfg).map_err(TelemetryPipelineError::Samples)?;
+        let gcr =
+            decode_gcr_from_captures_cfg(captures, cfg).map_err(TelemetryPipelineError::Samples)?;
         let payload = self
             .decode_payload(gcr.frame)
             .map_err(TelemetryPipelineError::GcrDecode)?;
@@ -374,7 +375,10 @@ impl BidirDecoder {
         }
     }
 
-    pub fn decode_gcr_captures(&self, captures: &[u32]) -> Result<GcrDecodeResult, SampleDecodeError> {
+    pub fn decode_gcr_captures(
+        &self,
+        captures: &[u32],
+    ) -> Result<GcrDecodeResult, SampleDecodeError> {
         decode_gcr_from_captures_cfg(captures, self.cfg)
     }
 
@@ -395,8 +399,11 @@ impl BidirDecoder {
         } else {
             self.stream_buf.copy_within(1..STREAM_BUFFER_CAPACITY, 0);
             self.stream_buf[STREAM_BUFFER_CAPACITY - 1] = sample;
-            self.stream_tuning_state.hint.preamble_skip =
-                self.stream_tuning_state.hint.preamble_skip.saturating_sub(1);
+            self.stream_tuning_state.hint.preamble_skip = self
+                .stream_tuning_state
+                .hint
+                .preamble_skip
+                .saturating_sub(1);
         }
 
         let mut hint = self.stream_tuning_state.hint;
@@ -967,7 +974,11 @@ mod tests {
         let mut acc = 0u32;
 
         out[0] = 0;
-        for (i, &pulse) in pulse_bits.iter().take(pulse_bits.len().saturating_sub(1)).enumerate() {
+        for (i, &pulse) in pulse_bits
+            .iter()
+            .take(pulse_bits.len().saturating_sub(1))
+            .enumerate()
+        {
             acc = acc.wrapping_add((pulse * ticks_per_bit) as u32);
             out[i + 1] = acc;
         }
