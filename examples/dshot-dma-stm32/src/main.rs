@@ -25,6 +25,10 @@ const TX_LOG_EVERY_FRAMES: u32 = 20_000;
 const DEMO_THROTTLE_MAX_PERCENT: u16 = 25;
 const DSHOT_MAX_THROTTLE: u16 = 1_999;
 
+embassy_stm32::bind_interrupts!(struct Irqs {
+    DMA2_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
+});
+
 fn throttle_percent_to_raw(percent: u16) -> u16 {
     let clamped = percent.clamp(0, 100);
     ((clamped as u32 * DSHOT_MAX_THROTTLE as u32) / 100) as u16
@@ -91,13 +95,18 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     let tx_pin = DshotTxPin::new_ch1(p.PA8);
-    let controller =
-        Stm32DshotController::tx_only(p.TIM1, tx_pin, p.DMA2_CH5, DshotSpeed::Dshot300);
+    let controller = Stm32DshotController::tx_only(
+        p.TIM1,
+        tx_pin,
+        p.DMA2_CH5,
+        Irqs,
+        DshotSpeed::Dshot300,
+    );
 
     let sender = MOTOR_THROTTLE.sender();
     sender.send(0);
     let receiver = unwrap!(MOTOR_THROTTLE.receiver());
 
-    spawner.must_spawn(motor_task(controller, receiver));
+    spawner.spawn(unwrap!(motor_task(controller, receiver)));
     run_demo(&sender).await
 }

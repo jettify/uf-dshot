@@ -1,13 +1,15 @@
-//! Experimental Embassy STM32 runtime API for single-line DShot.
-
 use core::marker::PhantomData;
 
-use embassy_stm32_hal::dma::{Transfer, TransferOptions};
+use embassy_stm32_hal::dma::{
+    Channel as DmaChannel, InterruptHandler as DmaInterruptHandler, TransferOptions,
+};
 use embassy_stm32_hal::gpio::{AfType, Flex, OutputType, Pull, Speed};
 use embassy_stm32_hal::interrupt::typelevel::Binding;
 use embassy_stm32_hal::time::Hertz;
 use embassy_stm32_hal::timer::input_capture::InputCapture;
-use embassy_stm32_hal::timer::low_level::{CountingMode, OutputCompareMode, OutputPolarity, Timer};
+use embassy_stm32_hal::timer::low_level::{
+    CountingMode, OutputCompareMode, OutputPolarity, RoundTo, Timer,
+};
 use embassy_stm32_hal::timer::{
     CaptureCompareInterruptHandler, Ch1, Ch2, Ch3, Ch4, Channel, GeneralInstance4Channel,
     TimerChannel, TimerPin, UpDma,
@@ -161,13 +163,15 @@ where
 {
     timer: Timer<'d, T>,
     tx_pin: DshotTxPin<'d, T>,
-    tx_dma: Peri<'d, D>,
+    tx_dma: DmaChannel<'d>,
+    tx_dma_request: embassy_stm32_hal::dma::Request,
+    _tx_dma: PhantomData<D>,
     speed: DshotSpeed,
     waveform_timing: WaveformTiming,
     timeouts: RuntimeTimeouts,
     release_pull: Option<Pull>,
     line_in_tx_mode: bool,
-    duty_buffer: [u16; TX_BUFFER_SLOTS],
+    duty_buffer: [T::Word; TX_BUFFER_SLOTS],
 }
 
 impl<'d, T, D> TxBackend<'d, T, D>
@@ -179,10 +183,13 @@ where
         timer: Peri<'d, T>,
         mut tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
+        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
         speed: DshotSpeed,
         output_polarity: OutputPolarity,
     ) -> Self {
         let timer = Timer::new(timer);
+        let tx_dma_request = tx_dma.request();
+        let tx_dma = DmaChannel::new(tx_dma, tx_dma_irq);
         tx_pin.enter_tx();
         let period_ticks = setup_dshot_timer(&timer, tx_pin.channel(), speed, output_polarity);
         let waveform_timing = WaveformTiming {
@@ -195,12 +202,14 @@ where
             timer,
             tx_pin,
             tx_dma,
+            tx_dma_request,
+            _tx_dma: PhantomData,
             speed,
             waveform_timing,
             timeouts: RuntimeTimeouts::default(),
             release_pull: None,
             line_in_tx_mode: true,
-            duty_buffer: [0; TX_BUFFER_SLOTS],
+            duty_buffer: [T::Word::from(0u16); TX_BUFFER_SLOTS],
         }
     }
 
@@ -220,7 +229,7 @@ where
             self.line_in_tx_mode = true;
         }
         let channel = self.tx_pin.channel();
-        self.timer.set_compare_value(channel, 0);
+        self.timer.set_compare_value(channel, 0u16.into());
         self.timer.enable_outputs();
         self.timer.enable_channel(channel, true);
     }
@@ -230,7 +239,7 @@ where
 
         self.timer.enable_update_dma(false);
         self.timer.stop();
-        self.timer.set_compare_value(channel, 0);
+        self.timer.set_compare_value(channel, 0u16.into());
         self.timer.enable_channel(channel, false);
 
         if let Some(pull) = self.release_pull {
@@ -259,8 +268,13 @@ where
         release_after_send: bool,
     ) -> Result<EncodedFrame, Stm32RuntimeError> {
         let waveform = frame.to_waveform_ticks(self.waveform_timing, true);
-        self.duty_buffer[..16].copy_from_slice(&waveform.bit_high_ticks);
-        self.duty_buffer[16] = waveform.reset_low_ticks.unwrap_or(0);
+        for (slot, ticks) in self.duty_buffer[..16]
+            .iter_mut()
+            .zip(waveform.bit_high_ticks.iter().copied())
+        {
+            *slot = ticks.into();
+        }
+        self.duty_buffer[16] = waveform.reset_low_ticks.unwrap_or(0).into();
 
         self.prepare_for_tx();
         let original_update_dma_state = self.timer.get_update_dma_state();
@@ -268,22 +282,22 @@ where
             self.timer.enable_update_dma(true);
         }
 
-        let req = self.tx_dma.request();
         let ccr = self
             .timer
-            .regs_1ch()
+            .regs_gp16()
             .ccr(self.tx_pin.channel().index())
-            .as_ptr() as *mut u16;
-        let mut options = TransferOptions::default();
-        options.fifo_threshold = Some(embassy_stm32_hal::dma::FifoThreshold::Full);
-        options.mburst = embassy_stm32_hal::dma::Burst::Incr8;
+            .as_ptr() as *mut T::Word;
+        let options = TransferOptions::default();
+        let duty_buffer = &self.duty_buffer;
+        let tx_dma = &mut self.tx_dma;
+        let tx_dma_request = self.tx_dma_request;
 
         // SAFETY: DMA writes the provided waveform buffer into the timer CCR register while
         // both the timer peripheral and the buffer remain alive for the transfer duration.
         let tx_result = unsafe {
             with_timeout(
                 self.timeouts.tx,
-                Transfer::new_write(self.tx_dma.reborrow(), req, &self.duty_buffer, ccr, options),
+                tx_dma.write(tx_dma_request, duty_buffer, ccr, options),
             )
             .await
         };
@@ -386,7 +400,7 @@ where
         )
         .await
         .map_err(|_| Stm32RuntimeError::RxTimeout)?;
-        captures[captured] = first_edge;
+        captures[captured] = first_edge.into();
         captured += 1;
 
         let inter_edge_timeout =
@@ -399,7 +413,7 @@ where
             .await
             {
                 Ok(ts) => {
-                    captures[captured] = ts;
+                    captures[captured] = ts.into();
                     captured += 1;
                 }
                 Err(_) => break,
@@ -431,10 +445,18 @@ where
         timer: Peri<'d, T>,
         tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
+        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
         speed: DshotSpeed,
     ) -> Self {
         Self {
-            tx: TxBackend::new(timer, tx_pin, tx_dma, speed, OutputPolarity::ActiveHigh),
+            tx: TxBackend::new(
+                timer,
+                tx_pin,
+                tx_dma,
+                tx_dma_irq,
+                speed,
+                OutputPolarity::ActiveHigh,
+            ),
             speed,
         }
     }
@@ -501,6 +523,7 @@ where
         timer: Peri<'d, T>,
         tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
+        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
         rx_cfg: Stm32BidirCapture,
         irq: impl Binding<T::CaptureCompareInterrupt, CaptureCompareInterruptHandler<T>> + 'd,
         speed: DshotSpeed,
@@ -509,9 +532,16 @@ where
         let rx_timer = unsafe { timer.clone_unchecked() };
 
         Ok(Self {
-            tx: TxBackend::new(timer, tx_pin, tx_dma, speed, OutputPolarity::ActiveLow)
-                .with_timeouts(rx_cfg.timeouts)
-                .with_release_pull(rx_cfg.pull),
+            tx: TxBackend::new(
+                timer,
+                tx_pin,
+                tx_dma,
+                tx_dma_irq,
+                speed,
+                OutputPolarity::ActiveLow,
+            )
+            .with_timeouts(rx_cfg.timeouts)
+            .with_release_pull(rx_cfg.pull),
             rx: RxBackend::new(rx_timer, rx_cfg, irq, speed)?,
             speed,
         })
@@ -574,12 +604,19 @@ fn setup_dshot_timer<T: GeneralInstance4Channel>(
     timer.set_output_compare_preload(channel, true);
     timer.set_output_polarity(channel, output_polarity);
     timer.enable_channel(channel, true);
-    timer.set_frequency(Hertz(speed.timing_hints().nominal_bitrate_hz));
-    timer.set_compare_value(channel, 0);
+    timer.set_frequency(
+        Hertz(speed.timing_hints().nominal_bitrate_hz),
+        RoundTo::Faster,
+    );
+    timer.set_compare_value(channel, 0u16.into());
     timer.enable_outputs();
     timer.start();
 
-    (timer.get_max_compare_value() as u16).saturating_add(1)
+    let max_compare_value: u32 = timer.get_max_compare_value().into();
+    match u16::try_from(max_compare_value) {
+        Ok(value) => value.saturating_add(1),
+        Err(_) => u16::MAX,
+    }
 }
 
 async fn send_command_with_policy<T, D>(
