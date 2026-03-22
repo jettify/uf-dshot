@@ -168,6 +168,7 @@ where
     _tx_dma: PhantomData<D>,
     speed: DshotSpeed,
     waveform_timing: WaveformTiming,
+    output_polarity: OutputPolarity,
     timeouts: RuntimeTimeouts,
     release_pull: Option<Pull>,
     line_in_tx_mode: bool,
@@ -206,6 +207,7 @@ where
             _tx_dma: PhantomData,
             speed,
             waveform_timing,
+            output_polarity,
             timeouts: RuntimeTimeouts::default(),
             release_pull: None,
             line_in_tx_mode: true,
@@ -228,7 +230,9 @@ where
             self.tx_pin.enter_tx();
             self.line_in_tx_mode = true;
         }
+
         let channel = self.tx_pin.channel();
+        setup_dshot_timer(&self.timer, channel, self.speed, self.output_polarity);
         self.timer.set_compare_value(channel, 0u16.into());
         self.timer.enable_outputs();
         self.timer.enable_channel(channel, true);
@@ -600,6 +604,7 @@ fn setup_dshot_timer<T: GeneralInstance4Channel>(
     output_polarity: OutputPolarity,
 ) -> u16 {
     timer.stop();
+    timer.reset();
     timer.set_output_compare_mode(channel, OutputCompareMode::PwmMode1);
     timer.set_output_compare_preload(channel, true);
     timer.set_output_polarity(channel, output_polarity);
@@ -610,6 +615,7 @@ fn setup_dshot_timer<T: GeneralInstance4Channel>(
     );
     timer.set_compare_value(channel, 0u16.into());
     timer.enable_outputs();
+    timer.generate_update_event();
     timer.start();
 
     let max_compare_value: u32 = timer.get_max_compare_value().into();
