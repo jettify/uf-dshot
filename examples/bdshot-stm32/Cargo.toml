@@ -15,7 +15,7 @@ defmt = { version = "1.0.1", optional = true }
 defmt-rtt = { version = "1.1.0", optional = true }
 embassy-executor = { version = "0.9.1", features = [
   "arch-cortex-m",
-  "executor-thread",
+  "executor-interrupt",
 ] }
 embassy-futures = "0.1.2"
 embassy-sync = "0.7.2"
@@ -24,6 +24,7 @@ panic-halt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 embassy-stm32 = { version = "0.5.0", features = [
   "memory-x",
+  "rt",
   "stm32f411ce",
   "time-driver-any",
   "exti",

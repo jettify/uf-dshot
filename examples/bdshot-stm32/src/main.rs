@@ -4,123 +4,135 @@
 #[macro_use]
 mod fmt;
 
-use embassy_executor::Spawner;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::watch::{Receiver, Sender, Watch};
-use embassy_time::{Duration, Ticker, Timer as EmbassyTimer};
+use cortex_m::asm;
+use cortex_m_rt::entry;
+use embassy_executor::InterruptExecutor;
+use embassy_stm32::gpio::Pull;
+use embassy_stm32::interrupt::{self, InterruptExt, Priority};
+use embassy_time::{Duration, Instant, Ticker};
 
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
 use uf_dshot::embassy_stm32::{
-    DshotTxPin, RuntimeTimeouts, Stm32BidirCapture, Stm32BidirController,
+    DshotTxPin,
+    RuntimeTimeouts,
+    Stm32BidirCapture,
+    Stm32BidirController,
+    Stm32RuntimeError,
 };
-use uf_dshot::{DshotSpeed, OversamplingConfig};
+use uf_dshot::{Command, DshotSpeed, OversamplingConfig};
 #[cfg(feature = "defmt")]
-use {defmt_rtt as _, panic_probe as _};
+use {defmt::warn, defmt_rtt as _, panic_probe as _};
 
-static MOTOR_THROTTLE: Watch<ThreadModeRawMutex, u16, 1> = Watch::new_with(0);
+const ESC_SPEED: DshotSpeed = DshotSpeed::Dshot300;
+const ARM_DURATION_MS: u64 = 3_000;
+const ARM_PERIOD_US: u64 = 200;
+const THROTTLE_DELAY_SECS: u64 = 30;
+const DEMO_THROTTLE: u16 = 200;
+const STATUS_LOG_EVERY_FRAMES: u32 = 1_000;
+const RX_TIMEOUT_US: u64 = 300;
+const RX_SAMPLE_COUNT: usize = 120;
 
-const ARMING_DELAY_MS: u64 = 7_000;
-const TX_PERIOD_US: u64 = 70;
-const TELEMETRY_LOG_EVERY_FRAMES: u32 = 20_000;
-const DEMO_THROTTLE_MAX_PERCENT: u16 = 25;
-const DSHOT_MAX_THROTTLE: u16 = 1_999;
+static EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
-fn throttle_percent_to_raw(percent: u16) -> u16 {
-    let clamped = percent.clamp(0, 100);
-    ((clamped as u32 * DSHOT_MAX_THROTTLE as u32) / 100) as u16
-}
-
-async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
-    EmbassyTimer::after(Duration::from_millis(ARMING_DELAY_MS)).await;
-    info!("start loop");
-
-    loop {
-        for value in 0..=DEMO_THROTTLE_MAX_PERCENT {
-            sender.send(value);
-            info!("bdshot up {}", value);
-            EmbassyTimer::after(Duration::from_secs(1)).await;
-        }
-        for value in (0..=DEMO_THROTTLE_MAX_PERCENT).rev() {
-            sender.send(value);
-            info!("bdshot down {}", value);
-            EmbassyTimer::after(Duration::from_secs(1)).await;
-        }
-    }
+#[interrupt]
+unsafe fn PVD() {
+    EXECUTOR.on_interrupt();
 }
 
 #[embassy_executor::task]
-async fn motor_task(
-    mut controller: Stm32BidirController<
-        'static,
-        embassy_stm32::peripherals::TIM1,
-        embassy_stm32::peripherals::DMA2_CH5,
-        embassy_stm32::peripherals::TIM2,
-        embassy_stm32::peripherals::DMA1_CH1,
-    >,
-    mut receiver: Receiver<'static, ThreadModeRawMutex, u16, 1>,
-) -> ! {
-    unwrap!(controller.arm().await);
+async fn run(p: embassy_stm32::Peripherals) {
 
-    let mut ticker = Ticker::every(Duration::from_micros(TX_PERIOD_US));
-    let mut frames_sent = 0u32;
-    let mut throttle_percent = 0u16;
+    let mut tx_pin = DshotTxPin::new_ch1(p.PA8);
+    tx_pin.prepare_bidirectional_idle();
 
-    info!("tx/rx loop started dshot300");
+    let rx_cfg = Stm32BidirCapture::new(OversamplingConfig::default())
+        .with_pull(Pull::None)
+        .with_sample_count(RX_SAMPLE_COUNT)
+        .with_timeouts(RuntimeTimeouts {
+            tx: Duration::from_millis(2),
+            rx: Duration::from_micros(RX_TIMEOUT_US),
+        });
+    let mut esc =
+        unwrap!(Stm32BidirController::bidirectional(p.TIM1, tx_pin, p.DMA2_CH5, rx_cfg, ESC_SPEED));
+    let tx_period_us = u64::from(ESC_SPEED.timing_hints().min_frame_period_us);
+    info!(
+        "bdshot rx cfg pull=None sample_count={} rx_timeout_us={}",
+        RX_SAMPLE_COUNT, RX_TIMEOUT_US
+    );
 
+    info!("arming at {} us packet period", ARM_PERIOD_US);
+    let mut arm_ticker = Ticker::every(Duration::from_micros(ARM_PERIOD_US));
+    let arm_frames = (ARM_DURATION_MS * 1_000) / ARM_PERIOD_US;
+    for _ in 0..arm_frames {
+        unwrap!(esc.send_command(Command::MotorStop).await);
+        arm_ticker.next().await;
+    }
+
+    let mut ticker = Ticker::every(Duration::from_micros(tx_period_us));
+    let mut send_throttle = false;
+    let switch_at = Instant::now() + Duration::from_secs(THROTTLE_DELAY_SECS);
+    let mut frames = 0u32;
+    let mut rx_ok = 0u32;
+    let mut rx_timeout = 0u32;
+    let mut rx_decode_err = 0u32;
+    info!(
+        "sending bidirectional MotorStop for {} s, then throttle {}",
+        THROTTLE_DELAY_SECS, DEMO_THROTTLE
+    );
     loop {
-        frames_sent = frames_sent.wrapping_add(1);
-        throttle_percent = receiver.try_get().unwrap_or(throttle_percent);
-
-        let raw_throttle = throttle_percent_to_raw(throttle_percent);
-        match controller.send_throttle_and_receive(raw_throttle).await {
-            Ok(frame) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
-                info!(
-                    "telemetry throttle={} raw={} value={:?}",
-                    throttle_percent,
-                    raw_throttle,
-                    frame
-                );
-            }
-            Err(err) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
-                info!(
-                    "telemetry err throttle={} raw={} err={:?}",
-                    throttle_percent,
-                    raw_throttle,
-                    err
-                );
-            }
-            _ => {}
+        frames = frames.wrapping_add(1);
+        if !send_throttle && Instant::now() >= switch_at {InterruptExecutor
+            send_throttle = true;
+            info!("switching to bidirectional throttle {}", DEMO_THROTTLE);
         }
 
+        let result = if send_throttle {
+            esc.send_throttle_and_receive(DEMO_THROTTLE).await
+        } else {
+            esc.send_command_and_receive(Command::MotorStop).await
+        };
+
+        match result {
+            Ok(frame) => {
+                rx_ok = rx_ok.wrapping_add(1);
+                info!("telemetry {:?}", frame);
+            }
+            Err(Stm32RuntimeError::Telemetry(err)) => {
+                rx_decode_err = rx_decode_err.wrapping_add(1);
+                if frames % STATUS_LOG_EVERY_FRAMES == 0 {
+                    info!("rx decode err {:?}", err);
+                }
+            }
+            Err(Stm32RuntimeError::RxTimeout) => {
+                rx_timeout = rx_timeout.wrapping_add(1);
+            }
+            Err(Stm32RuntimeError::TxTimeout) => warn!("bdshot tx timeout"),
+        }
+        if frames % STATUS_LOG_EVERY_FRAMES == 0 {
+            info!(
+                "status frames={} mode={} rx_ok={} rx_timeout={} rx_decode_err={}",
+                frames,
+                if send_throttle { "throttle" } else { "stop" },
+                rx_ok,
+                rx_timeout,
+                rx_decode_err
+            );
+        }
         ticker.next().await;
     }
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
+#[entry]
+fn main() -> ! {
     let p = embassy_stm32::init(Default::default());
 
-    // Adjust timer/DMA/pin mapping here to match your board.
-    let tx_pin = DshotTxPin::new_ch1(p.PA8);
-    let rx_cfg = Stm32BidirCapture::new(p.TIM2, p.DMA1_CH1, OversamplingConfig::default())
-        .with_timeouts(RuntimeTimeouts {
-            tx: Duration::from_millis(2),
-            rx: Duration::from_micros(100),
-        });
-    let controller = unwrap!(Stm32BidirController::bidirectional(
-        p.TIM1,
-        tx_pin,
-        p.DMA2_CH5,
-        rx_cfg,
-        DshotSpeed::Dshot300,
-    ));
+    interrupt::PVD.set_priority(Priority::P6);
+    let spawner = EXECUTOR.start(interrupt::PVD);
+    unwrap!(spawner.spawn(run(p)));
 
-    let sender = MOTOR_THROTTLE.sender();
-    sender.send(0);
-    let receiver = unwrap!(MOTOR_THROTTLE.receiver());
-
-    spawner.must_spawn(motor_task(controller, receiver));
-    run_demo(&sender).await
+    loop {
+        asm::wfi();
+    }
 }

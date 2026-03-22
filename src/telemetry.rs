@@ -294,14 +294,50 @@ impl BidirDecoder {
 
         match self.decode(samples, hint) {
             Ok(decoded) => {
+                self.stats.successful_frames = self.stats.successful_frames.saturating_add(1);
+                self.stats.last_start_margin = decoded.gcr.start_margin;
                 self.observe_start_margin(decoded.gcr.start_margin);
                 Ok(decoded.frame)
             }
             Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
+                self.stats.no_edge = self.stats.no_edge.saturating_add(1);
                 self.observe_no_edge();
                 Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
             }
-            Err(err) => Err(err),
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::FrameTooShort)) => {
+                self.stats.frame_too_short = self.stats.frame_too_short.saturating_add(1);
+                Err(TelemetryPipelineError::Samples(
+                    SampleDecodeError::FrameTooShort,
+                ))
+            }
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::InvalidFrame)) => {
+                self.stats.invalid_frame = self.stats.invalid_frame.saturating_add(1);
+                Err(TelemetryPipelineError::Samples(
+                    SampleDecodeError::InvalidFrame,
+                ))
+            }
+            Err(TelemetryPipelineError::Samples(err)) => Err(TelemetryPipelineError::Samples(err)),
+            Err(TelemetryPipelineError::GcrDecode(GcrDecodeError::InvalidGcrSymbol)) => {
+                self.stats.invalid_gcr_symbol = self.stats.invalid_gcr_symbol.saturating_add(1);
+                Err(TelemetryPipelineError::GcrDecode(
+                    GcrDecodeError::InvalidGcrSymbol,
+                ))
+            }
+            Err(TelemetryPipelineError::PayloadParse(PayloadParseError::InvalidCrc {
+                calculated_crc,
+                packet_crc,
+            })) => {
+                self.stats.invalid_crc = self.stats.invalid_crc.saturating_add(1);
+                Err(TelemetryPipelineError::PayloadParse(
+                    PayloadParseError::InvalidCrc {
+                        calculated_crc,
+                        packet_crc,
+                    },
+                ))
+            }
+            Err(TelemetryPipelineError::PayloadParse(err)) => {
+                Err(TelemetryPipelineError::PayloadParse(err))
+            }
         }
     }
 
@@ -314,7 +350,7 @@ impl BidirDecoder {
     }
 
     pub fn decode_payload(&self, gcr: GcrFrame) -> Result<TelemetryPayload, GcrDecodeError> {
-        match decode_gcr(gcr.raw_21) {
+        match decode_gcr_with_slip(gcr.raw_21) {
             Some(raw_16) => Ok(TelemetryPayload { raw_16 }),
             None => Err(GcrDecodeError::InvalidGcrSymbol),
         }
@@ -567,6 +603,24 @@ pub fn decode_gcr(gcr_value: u32) -> Option<u16> {
         i += 1;
     }
     Some(result)
+}
+
+fn decode_gcr_with_slip(gcr_value: u32) -> Option<u16> {
+    let candidates = [
+        gcr_value,
+        (gcr_value << 1) & 0x1f_ffff,
+        gcr_value >> 1,
+        (gcr_value << 2) & 0x1f_ffff,
+        gcr_value >> 2,
+    ];
+
+    for candidate in candidates {
+        if let Some(decoded) = decode_gcr(candidate) {
+            return Some(decoded);
+        }
+    }
+
+    None
 }
 
 const GCR_ENCODE_TABLE: [u8; 16] = [
