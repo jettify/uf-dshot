@@ -50,13 +50,8 @@ async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
 
 #[embassy_executor::task]
 async fn motor_task(
-    mut controller: Stm32BidirController<
-        'static,
-        embassy_stm32::peripherals::TIM1,
-        embassy_stm32::peripherals::DMA2_CH5,
-        embassy_stm32::peripherals::TIM2,
-        embassy_stm32::peripherals::DMA1_CH1,
-    >,
+    mut controller:
+        Stm32BidirController<'static, embassy_stm32::peripherals::TIM1, embassy_stm32::peripherals::DMA2_CH5>,
     mut receiver: Receiver<'static, ThreadModeRawMutex, u16, 1>,
 ) -> ! {
     unwrap!(controller.arm().await);
@@ -96,17 +91,22 @@ async fn motor_task(
     }
 }
 
+embassy_stm32::bind_interrupts!(struct DmaIrqs {
+    DMA2_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
+});
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     // Adjust timer/DMA/pin mapping here to match your board.
     let tx_pin = DshotTxPin::new_ch1(p.PA8);
-    let rx_cfg = Stm32BidirCapture::new(p.TIM2, p.DMA1_CH1, OversamplingConfig::default());
+    let rx_cfg = Stm32BidirCapture::new(OversamplingConfig::default());
     let controller = unwrap!(Stm32BidirController::bidirectional(
         p.TIM1,
         tx_pin,
         p.DMA2_CH5,
+        DmaIrqs,
         rx_cfg,
         DshotSpeed::Dshot300,
     ));
@@ -115,6 +115,6 @@ async fn main(spawner: Spawner) {
     sender.send(0);
     let receiver = unwrap!(MOTOR_THROTTLE.receiver());
 
-    spawner.must_spawn(motor_task(controller, receiver));
+    spawner.spawn(unwrap!(motor_task(controller, receiver)));
     run_demo(&sender).await
 }

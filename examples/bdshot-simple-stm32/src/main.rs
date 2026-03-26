@@ -40,10 +40,6 @@ embassy_stm32::bind_interrupts!(struct DmaIrqs {
     DMA2_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
 });
 
-embassy_stm32::bind_interrupts!(struct TimerIrqs {
-    TIM1_CC => embassy_stm32::timer::CaptureCompareInterruptHandler<embassy_stm32::peripherals::TIM1>;
-});
-
 #[embassy_executor::task]
 async fn app() {
     let p = embassy_stm32::init(Default::default());
@@ -56,7 +52,6 @@ async fn app() {
         p.DMA2_CH5,
         DmaIrqs,
         rx_cfg,
-        TimerIrqs,
         ESC_SPEED,
     ));
 

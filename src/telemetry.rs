@@ -315,51 +315,6 @@ impl BidirDecoder {
         }
     }
 
-    pub fn decode_captures(
-        &self,
-        captures: &[u32],
-    ) -> Result<DecodedTelemetry, TelemetryPipelineError> {
-        let gcr = self
-            .decode_gcr_captures(captures)
-            .map_err(TelemetryPipelineError::Samples)?;
-        let payload = self
-            .decode_payload(gcr.frame)
-            .map_err(TelemetryPipelineError::GcrDecode)?;
-        let frame = self
-            .parse_payload(payload)
-            .map_err(TelemetryPipelineError::PayloadParse)?;
-
-        Ok(DecodedTelemetry {
-            gcr,
-            payload,
-            frame,
-        })
-    }
-
-    pub fn decode_capture_frame(
-        &self,
-        captures: &[u32],
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        self.decode_captures(captures).map(|decoded| decoded.frame)
-    }
-
-    pub fn decode_capture_frame_with_ticks(
-        &self,
-        captures: &[u32],
-        ticks_per_bit: u8,
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        let mut cfg = self.cfg;
-        cfg.oversampling = ticks_per_bit;
-
-        let gcr =
-            decode_gcr_from_captures_cfg(captures, cfg).map_err(TelemetryPipelineError::Samples)?;
-        let payload = self
-            .decode_payload(gcr.frame)
-            .map_err(TelemetryPipelineError::GcrDecode)?;
-        self.parse_payload(payload)
-            .map_err(TelemetryPipelineError::PayloadParse)
-    }
-
     pub fn decode_gcr(
         &self,
         samples: &[u16],
@@ -373,13 +328,6 @@ impl BidirDecoder {
             Some(raw_16) => Ok(TelemetryPayload { raw_16 }),
             None => Err(GcrDecodeError::InvalidGcrSymbol),
         }
-    }
-
-    pub fn decode_gcr_captures(
-        &self,
-        captures: &[u32],
-    ) -> Result<GcrDecodeResult, SampleDecodeError> {
-        decode_gcr_from_captures_cfg(captures, self.cfg)
     }
 
     pub fn parse_payload(
@@ -752,56 +700,6 @@ fn decode_gcr_from_samples_cfg(
     })
 }
 
-fn decode_gcr_from_captures_cfg(
-    captures: &[u32],
-    cfg: OversamplingConfig,
-) -> Result<GcrDecodeResult, SampleDecodeError> {
-    validate_oversampling_config(cfg)?;
-
-    if captures.is_empty() {
-        return Err(SampleDecodeError::NoEdge);
-    }
-
-    if captures.len() < 2 {
-        return Err(SampleDecodeError::FrameTooShort);
-    }
-
-    let ticks_per_bit = u32::from(cfg.oversampling);
-    let frame_bits = u32::from(cfg.frame_bits);
-    let min_detected_bits = u32::from(cfg.min_detected_bits);
-
-    let mut gcr_value: u32 = 0;
-    let mut bits_found: u32 = 0;
-
-    for pair in captures.windows(2) {
-        let pulse_width_ticks = pair[1].wrapping_sub(pair[0]);
-        let len = ((pulse_width_ticks + ticks_per_bit / 2) / ticks_per_bit).max(1);
-
-        bits_found += len;
-        gcr_value <<= len;
-        gcr_value |= 1 << (len - 1);
-
-        if bits_found > frame_bits {
-            return Err(SampleDecodeError::InvalidFrame);
-        }
-    }
-
-    if bits_found < min_detected_bits {
-        return Err(SampleDecodeError::InvalidFrame);
-    }
-
-    let remaining_bits = frame_bits.saturating_sub(bits_found);
-    if remaining_bits > 0 {
-        gcr_value <<= remaining_bits;
-        gcr_value |= 1 << (remaining_bits - 1);
-    }
-
-    Ok(GcrDecodeResult {
-        frame: GcrFrame { raw_21: gcr_value },
-        start_margin: 0,
-    })
-}
-
 fn validate_oversampling_config(cfg: OversamplingConfig) -> Result<(), SampleDecodeError> {
     if cfg.oversampling == 0 {
         return Err(SampleDecodeError::InvalidConfig);
@@ -967,23 +865,6 @@ mod tests {
         }
 
         (out, out_len)
-    }
-
-    fn capture_timestamps_from_pulse_bits(pulse_bits: &[usize], ticks_per_bit: usize) -> [u32; 32] {
-        let mut out = [0u32; 32];
-        let mut acc = 0u32;
-
-        out[0] = 0;
-        for (i, &pulse) in pulse_bits
-            .iter()
-            .take(pulse_bits.len().saturating_sub(1))
-            .enumerate()
-        {
-            acc = acc.wrapping_add((pulse * ticks_per_bit) as u32);
-            out[i + 1] = acc;
-        }
-
-        out
     }
 
     #[test]
@@ -1257,66 +1138,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded, TelemetryFrame::Erpm(ErpmReading::new(1684)));
-    }
-
-    #[test]
-    fn end_to_end_decode_captures_known_value() {
-        let payload = 23130u16;
-        let gcr = encode_gcr(payload);
-        let (pulse_bits, pulse_len_count) = pulse_lengths_from_gcr(gcr);
-        let captures = capture_timestamps_from_pulse_bits(
-            &pulse_bits[..pulse_len_count],
-            OversamplingConfig::default().oversampling as usize,
-        );
-        let capture_len = pulse_len_count;
-
-        let decoder = BidirDecoder::new(OversamplingConfig::default());
-        let decoded = decoder
-            .decode_captures(&captures[..capture_len])
-            .expect("capture decode should succeed");
-
-        assert_eq!(decoded.payload.raw_16, payload);
-        assert_eq!(decoded.frame, TelemetryFrame::Erpm(ErpmReading::new(1684)));
-        assert_eq!(decoded.gcr.start_margin, 0);
-    }
-
-    #[test]
-    fn decode_captures_handles_counter_wraparound() {
-        let payload = 23130u16;
-        let gcr = encode_gcr(payload);
-        let (pulse_bits, pulse_len_count) = pulse_lengths_from_gcr(gcr);
-        let mut captures = capture_timestamps_from_pulse_bits(
-            &pulse_bits[..pulse_len_count],
-            OversamplingConfig::default().oversampling as usize,
-        );
-        let capture_len = pulse_len_count;
-
-        for ts in &mut captures[..capture_len] {
-            *ts = ts.wrapping_add(u32::from(u16::MAX) - 8);
-        }
-
-        let decoder = BidirDecoder::new(OversamplingConfig::default());
-        let decoded = decoder
-            .decode_captures(&captures[..capture_len])
-            .expect("wrapped capture decode should succeed");
-
-        assert_eq!(decoded.payload.raw_16, payload);
-    }
-
-    #[test]
-    fn decode_captures_too_short_errors() {
-        let decoder = BidirDecoder::new(OversamplingConfig::default());
-
-        assert_eq!(
-            decoder.decode_capture_frame(&[]),
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-        );
-        assert_eq!(
-            decoder.decode_capture_frame(&[3]),
-            Err(TelemetryPipelineError::Samples(
-                SampleDecodeError::FrameTooShort
-            ))
-        );
     }
 
     #[test]
