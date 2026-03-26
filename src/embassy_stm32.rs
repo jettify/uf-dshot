@@ -91,7 +91,7 @@ pub struct DshotTxPin<'d, T: GeneralInstance4Channel> {
     line: Flex<'d>,
     af_num: u8,
     pin_mask: u32,
-    idr_ptr: *mut u32,
+    idr_ptr: *const u32,
     channel: Channel,
     _timer: PhantomData<T>,
 }
@@ -116,8 +116,12 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
     fn new<C: TimerChannel>(pin: Peri<'d, impl TimerPin<T, C>>, channel: Channel) -> Self {
         let af_num = pin.af_num();
         let pin_mask = 1u32 << pin.pin();
-        let pin_port = pin.port() * PINS_PER_GPIO_PORT + pin.pin();
-        let idr_ptr = unsafe { AnyPin::steal(pin_port) }.block().idr().as_ptr() as *mut u32;
+        let pin_port =
+            (pin.port() as usize) * (PINS_PER_GPIO_PORT as usize) + (pin.pin() as usize);
+        let idr_ptr = unsafe { AnyPin::steal(pin_port as u8) }
+            .block()
+            .idr()
+            .as_ptr() as *const u32;
 
         Self {
             line: Flex::new(pin),
@@ -160,7 +164,7 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
         self.line.set_as_output(Speed::VeryHigh);
     }
 
-    fn idr_ptr(&self) -> *mut u32 {
+    fn idr_ptr(&self) -> *const u32 {
         self.idr_ptr
     }
 
@@ -290,30 +294,22 @@ where
     }
 
     fn prepare_for_tx(&mut self) {
-        if !self.line_in_tx_mode {
-            self.tx_pin.enter_tx();
-            self.line_in_tx_mode = true;
-        }
-
         configure_tx_timer(
             &self.timer,
             self.tx_pin.channel(),
             self.speed,
             self.output_polarity,
         );
+
+        if !self.line_in_tx_mode {
+            self.tx_pin.enter_tx();
+            self.line_in_tx_mode = true;
+        }
     }
 
     async fn send_encoded(
         &mut self,
         frame: EncodedFrame,
-    ) -> Result<EncodedFrame, Stm32RuntimeError> {
-        self.send_encoded_with_release(frame, true).await
-    }
-
-    async fn send_encoded_with_release(
-        &mut self,
-        frame: EncodedFrame,
-        release_after_send: bool,
     ) -> Result<EncodedFrame, Stm32RuntimeError> {
         let waveform = frame.to_waveform_ticks(self.waveform_timing, true);
         for (slot, ticks) in self.duty_buffer[..16]
@@ -325,11 +321,17 @@ where
         self.duty_buffer[16] = waveform.reset_low_ticks.unwrap_or(0).into();
 
         self.prepare_for_tx();
+        let _cleanup = TxCleanupGuard::new(
+            &self.timer,
+            &mut self.tx_pin,
+            self.idle_mode,
+            &mut self.line_in_tx_mode,
+        );
 
         let ccr = self
             .timer
             .regs_gp16()
-            .ccr(self.tx_pin.channel().index())
+            .ccr(_cleanup.channel.index())
             .as_ptr() as *mut T::Word;
         let options = TransferOptions::default();
         let duty_buffer = &self.duty_buffer;
@@ -346,25 +348,15 @@ where
 
         match tx_result {
             Ok(()) => {
-                if release_after_send {
-                    if matches!(self.idle_mode, TxIdleMode::Input(_)) {
-                        EmbassyTimer::after(bit_period_duration(self.speed)).await;
-                    }
-                    self.enter_idle_state();
-                }
+                // DMA completion means the trailing CCR=0 reset slot has been loaded into the
+                // timer, not that the final low interval has finished on the wire yet. Wait one
+                // bit period before cleanup so the line does not glitch between frames.
+                EmbassyTimer::after(bit_period_duration(self.speed)).await;
 
                 Ok(frame)
             }
-            Err(_) => {
-                self.recover_from_timeout();
-                Err(Stm32RuntimeError::TxTimeout)
-            }
+            Err(_) => Err(Stm32RuntimeError::TxTimeout),
         }
-    }
-
-    fn recover_from_timeout(&mut self) {
-        stop_tx_timer(&self.timer, self.tx_pin.channel());
-        self.enter_idle_state();
     }
 
     fn enter_idle_state(&mut self) {
@@ -373,6 +365,58 @@ where
             TxIdleMode::Input(pull) => self.tx_pin.enter_rx_pullup(pull),
         }
         self.line_in_tx_mode = false;
+    }
+}
+
+struct TxCleanupGuard<'a, 'd, T>
+where
+    T: GeneralInstance4Channel,
+{
+    timer: &'a Timer<'d, T>,
+    channel: Channel,
+    tx_pin: &'a mut DshotTxPin<'d, T>,
+    idle_mode: TxIdleMode,
+    line_in_tx_mode: &'a mut bool,
+}
+
+impl<'a, 'd, T> TxCleanupGuard<'a, 'd, T>
+where
+    T: GeneralInstance4Channel,
+{
+    fn new(
+        timer: &'a Timer<'d, T>,
+        tx_pin: &'a mut DshotTxPin<'d, T>,
+        idle_mode: TxIdleMode,
+        line_in_tx_mode: &'a mut bool,
+    ) -> Self {
+        Self {
+            timer,
+            channel: tx_pin.channel(),
+            tx_pin,
+            idle_mode,
+            line_in_tx_mode,
+        }
+    }
+}
+
+impl<T> Drop for TxCleanupGuard<'_, '_, T>
+where
+    T: GeneralInstance4Channel,
+{
+    fn drop(&mut self) {
+        match self.idle_mode {
+            TxIdleMode::DriveLow => {
+                // Disconnect the pin from the timer before stopping the channel so the timer
+                // shutdown sequence cannot leak a final pulse onto the wire.
+                self.tx_pin.enter_idle_low();
+                stop_tx_timer(self.timer, self.channel);
+            }
+            TxIdleMode::Input(pull) => {
+                stop_tx_timer(self.timer, self.channel);
+                self.tx_pin.enter_rx_pullup(pull);
+            }
+        }
+        *self.line_in_tx_mode = false;
     }
 }
 
@@ -500,30 +544,33 @@ impl RxBackend {
                 #[cfg(feature = "defmt")]
                 {
                     self.decode_error_count = self.decode_error_count.wrapping_add(1);
-                    let summary = summarize_samples_u16(&self.sample_words[..self.sample_count]);
-                    let stats = self.decoder.stats();
-                    defmt::warn!(
-                        "bdshot decode err count={} err={} highs={} lows={} edges={} first_edge={:?} last_edge={:?} hint_skip={} stats ok={} no_edge={} short={} invalid_frame={} invalid_gcr={} invalid_crc={} start_margin={} head={},{},{},{}",
-                        self.decode_error_count,
-                        err,
-                        summary.high_count,
-                        summary.low_count,
-                        summary.edge_count,
-                        summary.first_edge,
-                        summary.last_edge,
-                        self.decoder.stream_hint().preamble_skip,
-                        stats.successful_frames,
-                        stats.no_edge,
-                        stats.frame_too_short,
-                        stats.invalid_frame,
-                        stats.invalid_gcr_symbol,
-                        stats.invalid_crc,
-                        stats.last_start_margin,
-                        self.sample_words.first().copied().unwrap_or(0),
-                        self.sample_words.get(1).copied().unwrap_or(0),
-                        self.sample_words.get(2).copied().unwrap_or(0),
-                        self.sample_words.get(3).copied().unwrap_or(0),
-                    );
+                    if self.decode_error_count <= 4 || self.decode_error_count % 1000 == 0 {
+                        let summary =
+                            summarize_samples_u16(&self.sample_words[..self.sample_count]);
+                        let stats = self.decoder.stats();
+                        defmt::warn!(
+                            "bdshot decode err count={} err={} highs={} lows={} edges={} first_edge={:?} last_edge={:?} hint_skip={} stats ok={} no_edge={} short={} invalid_frame={} invalid_gcr={} invalid_crc={} start_margin={} head={},{},{},{}",
+                            self.decode_error_count,
+                            err,
+                            summary.high_count,
+                            summary.low_count,
+                            summary.edge_count,
+                            summary.first_edge,
+                            summary.last_edge,
+                            self.decoder.stream_hint().preamble_skip,
+                            stats.successful_frames,
+                            stats.no_edge,
+                            stats.frame_too_short,
+                            stats.invalid_frame,
+                            stats.invalid_gcr_symbol,
+                            stats.invalid_crc,
+                            stats.last_start_margin,
+                            self.sample_words.first().copied().unwrap_or(0),
+                            self.sample_words.get(1).copied().unwrap_or(0),
+                            self.sample_words.get(2).copied().unwrap_or(0),
+                            self.sample_words.get(3).copied().unwrap_or(0),
+                        );
+                    }
                 }
                 Err(Stm32RuntimeError::Telemetry(err))
             }
@@ -869,6 +916,7 @@ fn configure_tx_timer<T: GeneralInstance4Channel>(
     timer.set_compare_value(channel, 0u16.into());
     timer.enable_outputs();
     timer.generate_update_event();
+    timer.enable_update_dma(true);
 
     let max_compare_value: u32 = timer.get_max_compare_value().into();
     match u16::try_from(max_compare_value) {
@@ -884,13 +932,50 @@ fn start_timer<T: GeneralInstance4Channel>(timer: &Timer<'_, T>) {
 fn stop_tx_timer<T: GeneralInstance4Channel>(timer: &Timer<'_, T>, channel: Channel) {
     timer.enable_update_dma(false);
     timer.set_compare_value(channel, 0u16.into());
-    timer.enable_channel(channel, false);
     timer.stop();
+    timer.enable_channel(channel, false);
 }
 
 fn bit_period_duration(speed: DshotSpeed) -> Duration {
     let bitrate_hz = u64::from(speed.timing_hints().nominal_bitrate_hz);
     Duration::from_micros(1_000_000_u64.div_ceil(bitrate_hz))
+}
+
+struct RxSampleTimerGuard<'a, T>
+where
+    T: GeneralInstance4Channel,
+{
+    timer: &'a Timer<'a, T>,
+}
+
+impl<'a, T> RxSampleTimerGuard<'a, T>
+where
+    T: GeneralInstance4Channel,
+{
+    fn new(timer: &'a Timer<'a, T>, sample_hz: u32) -> Self {
+        timer.stop();
+        timer.enable_update_dma(false);
+        timer.reset();
+        timer.set_frequency(Hertz(sample_hz), RoundTo::Faster);
+        timer.generate_update_event();
+        timer.enable_update_dma(true);
+
+        Self { timer }
+    }
+
+    fn start(&self) {
+        self.timer.start();
+    }
+}
+
+impl<T> Drop for RxSampleTimerGuard<'_, T>
+where
+    T: GeneralInstance4Channel,
+{
+    fn drop(&mut self) {
+        self.timer.stop();
+        self.timer.enable_update_dma(false);
+    }
 }
 
 async fn capture_port_samples<T>(
@@ -905,22 +990,23 @@ async fn capture_port_samples<T>(
 where
     T: GeneralInstance4Channel,
 {
-    timer.stop();
-    timer.enable_update_dma(false);
-    timer.reset();
-    timer.set_frequency(Hertz(sample_hz), RoundTo::Faster);
-    timer.generate_update_event();
-    timer.enable_update_dma(true);
+    let timer_guard = RxSampleTimerGuard::new(timer, sample_hz);
 
     let options = TransferOptions::default();
     let rx_result = unsafe {
-        let transfer = dma.read_raw(dma_request, tx_pin.idr_ptr(), buffer as *mut [u32], options);
-        timer.start();
+        // SAFETY: DMA reads from the GPIO IDR register for the lifetime of `tx_pin`, writes into
+        // `buffer` for the duration of the transfer, and `dma` is exclusively borrowed here.
+        // Embassy's DMA API takes a `*mut` peripheral address for `read_raw`, even though GPIO IDR
+        // is a read-only register and this transfer only reads from it.
+        let transfer = dma.read_raw(
+            dma_request,
+            tx_pin.idr_ptr() as *mut u32,
+            buffer as *mut [u32],
+            options,
+        );
+        timer_guard.start();
         with_timeout(timeout, transfer).await
     };
-
-    timer.stop();
-    timer.enable_update_dma(false);
 
     match rx_result {
         Ok(()) => Ok(()),
@@ -967,7 +1053,7 @@ where
     let mut next_frame_at = Instant::now();
 
     while Instant::now() < deadline {
-        tx.send_encoded_with_release(frame, false).await?;
+        tx.send_encoded(frame).await?;
         next_frame_at += frame_period;
         let now = Instant::now();
         if now < next_frame_at {
@@ -976,11 +1062,6 @@ where
             next_frame_at = now;
         }
     }
-
-    if matches!(tx.idle_mode, TxIdleMode::Input(_)) {
-        EmbassyTimer::after(bit_period_duration(speed)).await;
-    }
-    tx.enter_idle_state();
 
     Ok(())
 }

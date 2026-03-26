@@ -47,20 +47,16 @@ async fn app() {
     let tx_pin = DshotTxPin::new_ch1(p.PA8);
     let rx_cfg = Stm32BidirCapture::new(OversamplingConfig::default());
     let mut esc = unwrap!(Stm32BidirController::bidirectional(
-        p.TIM1,
-        tx_pin,
-        p.DMA2_CH5,
-        DmaIrqs,
-        rx_cfg,
-        ESC_SPEED,
+        p.TIM1, tx_pin, p.DMA2_CH5, DmaIrqs, rx_cfg, ESC_SPEED,
     ));
 
-    let frame_period = Duration::from_micros(u64::from(ESC_SPEED.timing_hints().min_frame_period_us));
+    let frame_period =
+        Duration::from_micros(u64::from(3 * ESC_SPEED.timing_hints().min_frame_period_us));
     let mut ticker = Ticker::every(frame_period);
     let mut frames_sent = 0u32;
 
     info!("start arm");
-    unwrap!(esc.arm().await);
+    unwrap!(esc.arm_for(Duration::from_secs(20)).await);
 
     info!("spinning at throttle {}", DEMO_THROTTLE);
     loop {
