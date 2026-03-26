@@ -116,8 +116,7 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
     fn new<C: TimerChannel>(pin: Peri<'d, impl TimerPin<T, C>>, channel: Channel) -> Self {
         let af_num = pin.af_num();
         let pin_mask = 1u32 << pin.pin();
-        let pin_port =
-            (pin.port() as usize) * (PINS_PER_GPIO_PORT as usize) + (pin.pin() as usize);
+        let pin_port = (pin.port() as usize) * (PINS_PER_GPIO_PORT as usize) + (pin.pin() as usize);
         let idr_ptr = unsafe { AnyPin::steal(pin_port as u8) }
             .block()
             .idr()
@@ -351,7 +350,7 @@ where
                 // DMA completion means the trailing CCR=0 reset slot has been loaded into the
                 // timer, not that the final low interval has finished on the wire yet. Wait one
                 // bit period before cleanup so the line does not glitch between frames.
-                EmbassyTimer::after(bit_period_duration(self.speed)).await;
+                //EmbassyTimer::after(bit_period_duration(self.speed)).await;
 
                 Ok(frame)
             }
@@ -412,8 +411,11 @@ where
                 stop_tx_timer(self.timer, self.channel);
             }
             TxIdleMode::Input(pull) => {
-                stop_tx_timer(self.timer, self.channel);
+                // In bidirectional mode the ESC needs to take over the line immediately after
+                // the trailing reset slot. Release the pin to pulled-up input before stopping
+                // the timer so TIM shutdown activity cannot mask the first telemetry edge.
                 self.tx_pin.enter_rx_pullup(pull);
+                stop_tx_timer(self.timer, self.channel);
             }
         }
         *self.line_in_tx_mode = false;
