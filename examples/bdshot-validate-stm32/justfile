@@ -1,0 +1,6 @@
+build:
+  cargo build --release --target thumbv7em-none-eabihf
+
+flash:
+  cargo build --release --target thumbv7em-none-eabihf
+  probe-rs run --chip STM32F411CEUx target/thumbv7em-none-eabihf/release/bdshot-validate-stm32 --connect-under-reset
