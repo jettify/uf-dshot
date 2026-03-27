@@ -6,16 +6,15 @@ mod fmt;
 
 use cortex_m::asm;
 use embassy_stm32::gpio::Pull;
-use embassy_stm32::timer::GeneralInstance4Channel;
 use embassy_time::{Duration, Instant, Ticker};
 
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use uf_dshot::embassy_stm32::bidir_capture::{
-    DshotPortPin, RawDmaChannel, Stm32BidirPortController,
+use uf_dshot::proto::bitbang_bf::stm32::{
+    BidirCaptureConfig, BidirPortRuntimeConfig, DshotPortPin, InterruptHandler,
+    Stm32BidirPinController,
 };
-use uf_dshot::embassy_stm32::Stm32BidirCapture;
 use uf_dshot::{DshotSpeed, OversamplingConfig, TelemetryFrame};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
@@ -53,7 +52,7 @@ embassy_stm32::bind_interrupts!(struct ExecutorIrqs {
 });
 
 embassy_stm32::bind_interrupts!(struct DmaIrqs {
-    DMA2_STREAM1 => uf_dshot::embassy_stm32::bidir_capture::InterruptHandler<embassy_stm32::peripherals::DMA2_CH1>;
+    DMA2_STREAM3 => InterruptHandler<embassy_stm32::peripherals::DMA2_CH3>;
 });
 
 #[derive(Default)]
@@ -73,31 +72,32 @@ fn note_frame(frame: &TelemetryFrame, counters: &mut TelemetryCounters) {
     }
 }
 
-async fn hold_throttle<'d, T, D, const N: usize>(
-    esc: &mut Stm32BidirPortController<'d, T, D, N>,
+async fn hold_throttle(
+    esc: &mut Stm32BidirPinController<
+        'static,
+        embassy_stm32::peripherals::TIM1,
+        embassy_stm32::peripherals::DMA2_CH3,
+    >,
     throttle: u16,
     duration: Duration,
     frame_period: Duration,
     counters: &mut TelemetryCounters,
     frame_index: &mut u32,
-) where
-    T: GeneralInstance4Channel,
-    D: RawDmaChannel,
-{
+) {
     let started = Instant::now();
     let mut ticker = Ticker::every(frame_period);
 
     while Instant::now().saturating_duration_since(started) < duration {
         *frame_index = frame_index.wrapping_add(1);
 
-        match esc.send_throttles_and_receive([throttle]).await {
-            Ok([Ok(frame)]) => {
+        match esc.send_throttle_and_receive(throttle).await {
+            Ok(Ok(frame)) => {
                 note_frame(&frame, counters);
                 if *frame_index % TELEMETRY_LOG_EVERY_FRAMES == 0 {
                     info!("frame={} throttle={} telemetry={:?}", *frame_index, throttle, frame);
                 }
             }
-            Ok([Err(err)]) => {
+            Ok(Err(err)) => {
                 counters.decode_err = counters.decode_err.wrapping_add(1);
                 if *frame_index % TELEMETRY_LOG_EVERY_FRAMES == 0 {
                     info!(
@@ -130,18 +130,24 @@ async fn app() {
     let p = embassy_stm32::init(Default::default());
 
     let motor_pin = DshotPortPin::new(p.PA8);
-    let rx_cfg = Stm32BidirCapture::new(RX_OVERSAMPLING)
+    let rx_cfg = BidirCaptureConfig::new(RX_OVERSAMPLING)
         .with_sample_count(RX_SAMPLE_COUNT)
-        .with_pull(Pull::None)
-        .with_pacer_compare_percent(PACER_COMPARE_PERCENT);
-    let mut esc = unwrap!(Stm32BidirPortController::new_ch1(
+        .with_pull(Pull::None);
+    let mut esc = unwrap!(Stm32BidirPinController::new_ch1(
         p.TIM1,
-        p.DMA2_CH1,
+        p.DMA2_CH3,
         DmaIrqs,
-        [motor_pin],
+        motor_pin,
         rx_cfg,
         ESC_SPEED,
-    ));
+    )
+    .map(|esc| {
+        esc.with_runtime_config(BidirPortRuntimeConfig {
+            tx_timeout: Duration::from_millis(2),
+            rx_timeout: Duration::from_millis(2),
+            pacer_compare_percent: PACER_COMPARE_PERCENT,
+        })
+    }));
 
     let frame_period =
         Duration::from_micros(u64::from(ESC_SPEED.timing_hints().min_frame_period_us) * FRAME_MULTIPLIER);

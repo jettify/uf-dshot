@@ -1,8 +1,11 @@
 use core::array;
 use core::marker::PhantomData;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use embassy_stm32_hal::dma::{ChannelInstance as DmaChannelInstance, Request};
-use embassy_stm32_hal::gpio::{AnyPin, Flex, Pin, Speed};
+use embassy_stm32_hal::gpio::{AnyPin, Flex, Pin, Pull, Speed};
+use embassy_stm32_hal::interrupt::typelevel::{Binding, Handler};
 use embassy_stm32_hal::pac;
 use embassy_stm32_hal::timer::low_level::{OutputCompareMode, OutputPolarity, Timer};
 use embassy_stm32_hal::timer::{
@@ -11,12 +14,27 @@ use embassy_stm32_hal::timer::{
 use embassy_stm32_hal::Peri;
 use embassy_time::{Duration, Instant, Timer as EmbassyTimer};
 
+use crate::bidir_capture::decode_frame_bf_port_samples_u16;
 use crate::proto::bitbang_bf::{build_port_words, PortFrameError, SignalPolarity, TX_STATE_SLOTS};
-use crate::{Command, DshotSpeed, EncodedFrame, UniTx};
+use crate::telemetry::{
+    BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
+    TelemetryPipelineError,
+};
+use crate::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx};
 
 const MAX_PORT_MOTORS: usize = 4;
+const MAX_CAPTURE_SAMPLES: usize = 512;
 const PINS_PER_GPIO_PORT: u8 = 16;
 const DEFAULT_ARM_DURATION: Duration = Duration::from_millis(3_000);
+const PREAMBLE_MARGIN_SAMPLES: usize = 64;
+const DMA_IRQ_SLOTS: usize = 16;
+
+type DmaIrqFn = unsafe fn(*mut ());
+
+static DMA_IRQ_CTX: [AtomicPtr<()>; DMA_IRQ_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; DMA_IRQ_SLOTS];
+static DMA_IRQ_FN: [AtomicPtr<()>; DMA_IRQ_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; DMA_IRQ_SLOTS];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -43,6 +61,10 @@ pub enum PortConfigError {
     },
     MixedPorts,
     DuplicatePins,
+    SampleBufferTooSmall {
+        requested: usize,
+        capacity: usize,
+    },
     Frame(PortFrameError),
 }
 
@@ -51,7 +73,18 @@ pub enum PortConfigError {
 pub enum PortRuntimeError {
     TxTimeout,
     TxDmaError,
+    RxTimeout,
     Frame(PortFrameError),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum IrqPhase {
+    Idle = 0,
+    TxActive = 1,
+    RxActive = 2,
+    Done = 3,
+    Error = 4,
 }
 
 #[derive(Clone, Copy)]
@@ -62,11 +95,30 @@ struct PacerTimerConfig {
 }
 
 pub trait RawDmaChannel: DmaChannelInstance {
+    const IRQ_SLOT: usize;
     fn regs() -> pac::dma::Dma;
     fn stream_num() -> usize;
 }
 
+pub struct InterruptHandler<D: RawDmaChannel> {
+    _phantom: PhantomData<D>,
+}
+
+impl<D: RawDmaChannel> Handler<D::Interrupt> for InterruptHandler<D> {
+    unsafe fn on_interrupt() {
+        let ctx = DMA_IRQ_CTX[D::IRQ_SLOT].load(Ordering::Acquire);
+        let func = DMA_IRQ_FN[D::IRQ_SLOT].load(Ordering::Acquire);
+        if ctx.is_null() || func.is_null() {
+            return;
+        }
+
+        let func: DmaIrqFn = core::mem::transmute(func);
+        func(ctx);
+    }
+}
+
 impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH1 {
+    const IRQ_SLOT: usize = 9;
     fn regs() -> pac::dma::Dma {
         unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
     }
@@ -77,6 +129,7 @@ impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH1 {
 }
 
 impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH2 {
+    const IRQ_SLOT: usize = 10;
     fn regs() -> pac::dma::Dma {
         unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
     }
@@ -87,6 +140,7 @@ impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH2 {
 }
 
 impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH3 {
+    const IRQ_SLOT: usize = 11;
     fn regs() -> pac::dma::Dma {
         unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
     }
@@ -97,6 +151,7 @@ impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH3 {
 }
 
 impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH4 {
+    const IRQ_SLOT: usize = 12;
     fn regs() -> pac::dma::Dma {
         unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
     }
@@ -107,6 +162,7 @@ impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH4 {
 }
 
 impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH5 {
+    const IRQ_SLOT: usize = 13;
     fn regs() -> pac::dma::Dma {
         unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
     }
@@ -117,6 +173,7 @@ impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH5 {
 }
 
 impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH6 {
+    const IRQ_SLOT: usize = 14;
     fn regs() -> pac::dma::Dma {
         unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
     }
@@ -131,6 +188,7 @@ pub struct DshotPortPin<'d> {
     port: u8,
     pin_mask: u32,
     bsrr_ptr: *mut u32,
+    idr_ptr: *mut u16,
 }
 
 impl<'d> DshotPortPin<'d> {
@@ -145,12 +203,22 @@ impl<'d> DshotPortPin<'d> {
             port,
             pin_mask,
             bsrr_ptr: regs.bsrr().as_ptr() as *mut u32,
+            idr_ptr: regs.idr().as_ptr() as *mut u16,
         }
     }
 
     fn enter_output_low(&mut self) {
         self.line.set_low();
         self.line.set_as_output(Speed::VeryHigh);
+    }
+
+    fn enter_output_high(&mut self) {
+        self.line.set_high();
+        self.line.set_as_output(Speed::VeryHigh);
+    }
+
+    fn enter_input_pullup(&mut self, pull: Pull) {
+        self.line.set_as_input(pull);
     }
 
     fn port(&self) -> u8 {
@@ -163,6 +231,69 @@ impl<'d> DshotPortPin<'d> {
 
     fn bsrr_ptr(&self) -> *mut u32 {
         self.bsrr_ptr
+    }
+
+    fn idr_ptr(&self) -> *mut u16 {
+        self.idr_ptr
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BidirPortRuntimeConfig {
+    pub tx_timeout: Duration,
+    pub rx_timeout: Duration,
+    pub pacer_compare_percent: u8,
+}
+
+impl Default for BidirPortRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tx_timeout: Duration::from_millis(2),
+            rx_timeout: Duration::from_millis(2),
+            pacer_compare_percent: 50,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct BidirCaptureConfig {
+    oversampling: OversamplingConfig,
+    sample_count: usize,
+    decode_hint: DecodeHint,
+    pull: Pull,
+    preamble_tuning: PreambleTuningConfig,
+}
+
+impl BidirCaptureConfig {
+    pub fn new(oversampling: OversamplingConfig) -> Self {
+        Self {
+            sample_count: oversampling.recommended_capture_samples(PREAMBLE_MARGIN_SAMPLES),
+            oversampling,
+            decode_hint: DecodeHint::default(),
+            pull: Pull::Up,
+            preamble_tuning: PreambleTuningConfig::default(),
+        }
+    }
+
+    pub fn with_sample_count(mut self, sample_count: usize) -> Self {
+        self.sample_count = sample_count;
+        self
+    }
+
+    pub fn with_decode_hint(mut self, hint: DecodeHint) -> Self {
+        self.decode_hint = hint;
+        self
+    }
+
+    pub fn with_pull(mut self, pull: Pull) -> Self {
+        self.pull = pull;
+        self
+    }
+
+    pub fn with_preamble_tuning(mut self, tuning: PreambleTuningConfig) -> Self {
+        self.preamble_tuning = tuning;
+        self
     }
 }
 
@@ -396,6 +527,371 @@ where
     }
 }
 
+pub struct Stm32BidirPinController<'d, T, D>
+where
+    T: GeneralInstance4Channel,
+    D: RawDmaChannel,
+{
+    timer: Timer<'d, T>,
+    dma_request: Request,
+    pin: DshotPortPin<'d>,
+    channel: Channel,
+    speed: DshotSpeed,
+    runtime_cfg: BidirPortRuntimeConfig,
+    capture_cfg: BidirCaptureConfig,
+    tx_timer_cfg: PacerTimerConfig,
+    rx_timer_cfg: PacerTimerConfig,
+    decoder: BidirDecoder,
+    tx_words: [u32; TX_STATE_SLOTS],
+    raw_samples: [u16; MAX_CAPTURE_SAMPLES],
+    irq_phase: AtomicU8,
+    _dma: PhantomData<D>,
+}
+
+impl<'d, T, D> Stm32BidirPinController<'d, T, D>
+where
+    T: GeneralInstance4Channel,
+    D: RawDmaChannel,
+{
+    pub fn new_ch1(
+        timer: Peri<'d, T>,
+        dma: Peri<'d, D>,
+        dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
+        pin: DshotPortPin<'d>,
+        capture_cfg: BidirCaptureConfig,
+        speed: DshotSpeed,
+    ) -> Result<Self, PortConfigError>
+    where
+        D: Dma<T, Ch1>,
+    {
+        Self::new_inner::<Ch1>(timer, dma, dma_irq, pin, capture_cfg, speed)
+    }
+
+    pub fn new_ch2(
+        timer: Peri<'d, T>,
+        dma: Peri<'d, D>,
+        dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
+        pin: DshotPortPin<'d>,
+        capture_cfg: BidirCaptureConfig,
+        speed: DshotSpeed,
+    ) -> Result<Self, PortConfigError>
+    where
+        D: Dma<T, Ch2>,
+    {
+        Self::new_inner::<Ch2>(timer, dma, dma_irq, pin, capture_cfg, speed)
+    }
+
+    pub fn new_ch3(
+        timer: Peri<'d, T>,
+        dma: Peri<'d, D>,
+        dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
+        pin: DshotPortPin<'d>,
+        capture_cfg: BidirCaptureConfig,
+        speed: DshotSpeed,
+    ) -> Result<Self, PortConfigError>
+    where
+        D: Dma<T, Ch3>,
+    {
+        Self::new_inner::<Ch3>(timer, dma, dma_irq, pin, capture_cfg, speed)
+    }
+
+    pub fn new_ch4(
+        timer: Peri<'d, T>,
+        dma: Peri<'d, D>,
+        dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
+        pin: DshotPortPin<'d>,
+        capture_cfg: BidirCaptureConfig,
+        speed: DshotSpeed,
+    ) -> Result<Self, PortConfigError>
+    where
+        D: Dma<T, Ch4>,
+    {
+        Self::new_inner::<Ch4>(timer, dma, dma_irq, pin, capture_cfg, speed)
+    }
+
+    pub fn with_runtime_config(mut self, runtime_cfg: BidirPortRuntimeConfig) -> Self {
+        self.runtime_cfg = runtime_cfg;
+        self.tx_timer_cfg = compute_pacer_timer_config(
+            &self.timer,
+            self.speed.timing_hints().nominal_bitrate_hz * 3,
+            runtime_cfg.pacer_compare_percent,
+        );
+        self.rx_timer_cfg = compute_rx_timer_config(&self.timer, self.speed, runtime_cfg, self.capture_cfg);
+        configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
+        self
+    }
+
+    fn new_inner<C>(
+        timer: Peri<'d, T>,
+        dma: Peri<'d, D>,
+        _dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
+        mut pin: DshotPortPin<'d>,
+        capture_cfg: BidirCaptureConfig,
+        speed: DshotSpeed,
+    ) -> Result<Self, PortConfigError>
+    where
+        C: TimerChannel,
+        D: Dma<T, C>,
+    {
+        if capture_cfg.sample_count == 0 || capture_cfg.sample_count > MAX_CAPTURE_SAMPLES {
+            return Err(PortConfigError::SampleBufferTooSmall {
+                requested: capture_cfg.sample_count,
+                capacity: MAX_CAPTURE_SAMPLES,
+            });
+        }
+
+        let dma_request = dma.request();
+        dma.remap();
+        drop(dma);
+
+        let timer = Timer::new(timer);
+        let runtime_cfg = BidirPortRuntimeConfig::default();
+        let tx_timer_cfg = compute_pacer_timer_config(
+            &timer,
+            speed.timing_hints().nominal_bitrate_hz * 3,
+            runtime_cfg.pacer_compare_percent,
+        );
+        let rx_timer_cfg = compute_rx_timer_config(&timer, speed, runtime_cfg, capture_cfg);
+        configure_pacer_timer(&timer, C::CHANNEL, tx_timer_cfg);
+        pin.enter_input_pullup(capture_cfg.pull);
+
+        let mut decoder =
+            BidirDecoder::with_preamble_tuning(capture_cfg.oversampling, capture_cfg.preamble_tuning);
+        decoder.set_stream_hint(capture_cfg.decode_hint);
+
+        Ok(Self {
+            timer,
+            dma_request,
+            pin,
+            channel: C::CHANNEL,
+            speed,
+            runtime_cfg,
+            capture_cfg,
+            tx_timer_cfg,
+            rx_timer_cfg,
+            decoder,
+            tx_words: [0; TX_STATE_SLOTS],
+            raw_samples: [0; MAX_CAPTURE_SAMPLES],
+            irq_phase: AtomicU8::new(IrqPhase::Idle as u8),
+            _dma: PhantomData,
+        })
+    }
+
+    pub async fn arm_for(&mut self, duration: Duration) -> Result<(), PortRuntimeError> {
+        let frame_period =
+            Duration::from_micros(self.speed.timing_hints().min_frame_period_us as u64);
+        let deadline = Instant::now() + duration;
+        let stop_frame = BidirTx::command(Command::MotorStop).encode();
+
+        while Instant::now() < deadline {
+            self.send_frame(stop_frame).await?;
+            EmbassyTimer::after(frame_period).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn arm(&mut self) -> Result<(), PortRuntimeError> {
+        self.arm_for(DEFAULT_ARM_DURATION).await
+    }
+
+    pub async fn send_throttle_and_receive(
+        &mut self,
+        throttle: u16,
+    ) -> Result<Result<TelemetryFrame, TelemetryPipelineError>, PortRuntimeError> {
+        self.send_frame_and_receive(BidirTx::throttle_clamped(throttle).encode())
+            .await
+    }
+
+    pub async fn send_frame(&mut self, frame: EncodedFrame) -> Result<(), PortRuntimeError> {
+        self.tx_words = build_port_words(
+            self.pin.pin_mask(),
+            [self.pin.pin_mask()],
+            [frame],
+            SignalPolarity::Inverted,
+        )
+        .map_err(PortRuntimeError::Frame)?
+        .words;
+        self.run_tx_dma().await
+    }
+
+    pub async fn send_frame_and_receive(
+        &mut self,
+        frame: EncodedFrame,
+    ) -> Result<Result<TelemetryFrame, TelemetryPipelineError>, PortRuntimeError> {
+        self.tx_words = build_port_words(
+            self.pin.pin_mask(),
+            [self.pin.pin_mask()],
+            [frame],
+            SignalPolarity::Inverted,
+        )
+        .map_err(PortRuntimeError::Frame)?
+        .words;
+        self.run_tx_then_capture().await?;
+
+        Ok(decode_frame_bf_port_samples_u16(
+            &mut self.decoder,
+            &self.raw_samples[..self.capture_cfg.sample_count],
+            self.pin.pin_mask() as u16,
+        ))
+    }
+
+    unsafe fn register_irq_callback(&mut self) {
+        DMA_IRQ_CTX[D::IRQ_SLOT].store(self as *mut _ as *mut (), Ordering::Release);
+        DMA_IRQ_FN[D::IRQ_SLOT].store(Self::dma_irq as *mut (), Ordering::Release);
+    }
+
+    fn clear_irq_callback(&mut self) {
+        DMA_IRQ_CTX[D::IRQ_SLOT].store(ptr::null_mut(), Ordering::Release);
+        DMA_IRQ_FN[D::IRQ_SLOT].store(ptr::null_mut(), Ordering::Release);
+    }
+
+    async fn run_tx_dma(&mut self) -> Result<(), PortRuntimeError> {
+        configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
+        self.timer.set_cc_dma_enable_state(self.channel, false);
+        self.timer.reset();
+        self.pin.enter_output_high();
+
+        unsafe {
+            dma_start_write::<D>(
+                self.dma_request,
+                self.tx_words.as_ptr(),
+                self.pin.bsrr_ptr(),
+                self.tx_words.len(),
+            );
+        }
+
+        self.timer.set_cc_dma_enable_state(self.channel, true);
+        self.timer.start();
+
+        let deadline = Instant::now() + self.runtime_cfg.tx_timeout;
+        loop {
+            if dma_transfer_error::<D>() {
+                self.stop_dma_and_timer();
+                return Err(PortRuntimeError::TxDmaError);
+            }
+            if dma_transfer_complete::<D>() {
+                self.stop_dma_and_timer();
+                self.pin.enter_input_pullup(self.capture_cfg.pull);
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                self.stop_dma_and_timer();
+                self.pin.enter_input_pullup(self.capture_cfg.pull);
+                return Err(PortRuntimeError::TxTimeout);
+            }
+
+            EmbassyTimer::after(Duration::from_micros(1)).await;
+        }
+    }
+
+    async fn run_tx_then_capture(&mut self) -> Result<(), PortRuntimeError> {
+        configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
+        self.timer.set_cc_dma_enable_state(self.channel, false);
+        self.timer.reset();
+        self.irq_phase.store(IrqPhase::TxActive as u8, Ordering::Release);
+        self.pin.enter_output_high();
+
+        unsafe {
+            self.register_irq_callback();
+            dma_start_write_irq::<D>(
+                self.dma_request,
+                self.tx_words.as_ptr(),
+                self.pin.bsrr_ptr(),
+                self.tx_words.len(),
+            );
+            self.timer.set_cc_dma_enable_state(self.channel, true);
+            self.timer.start();
+        }
+
+        let tx_deadline = Instant::now() + self.runtime_cfg.tx_timeout;
+        let rx_deadline = tx_deadline + self.runtime_cfg.rx_timeout;
+        loop {
+            match self.irq_phase.load(Ordering::Acquire) {
+                x if x == IrqPhase::Done as u8 => {
+                    self.clear_irq_callback();
+                    return Ok(());
+                }
+                x if x == IrqPhase::Error as u8 => {
+                    self.clear_irq_callback();
+                    self.stop_dma_and_timer();
+                    return Err(PortRuntimeError::TxDmaError);
+                }
+                x if x == IrqPhase::TxActive as u8 && Instant::now() >= tx_deadline => {
+                    self.clear_irq_callback();
+                    self.stop_dma_and_timer();
+                    return Err(PortRuntimeError::TxTimeout);
+                }
+                x if x == IrqPhase::RxActive as u8 && Instant::now() >= rx_deadline => {
+                    self.clear_irq_callback();
+                    self.stop_dma_and_timer();
+                    return Err(PortRuntimeError::RxTimeout);
+                }
+                _ => {}
+            }
+
+            EmbassyTimer::after(Duration::from_micros(1)).await;
+        }
+    }
+
+    fn stop_dma_and_timer(&mut self) {
+        dma_disable::<D>();
+        dma_clear_flags::<D>();
+        self.timer.stop();
+        self.timer.set_cc_dma_enable_state(self.channel, false);
+        self.pin.enter_input_pullup(self.capture_cfg.pull);
+        self.irq_phase.store(IrqPhase::Idle as u8, Ordering::Release);
+    }
+
+    unsafe fn dma_irq(ctx: *mut ()) {
+        let this = &mut *(ctx as *mut Self);
+        let regs = D::regs();
+        let isr = regs.isr(D::stream_num() / 4).read();
+        let bit = D::stream_num() % 4;
+
+        if isr.teif(bit) {
+            regs.ifcr(D::stream_num() / 4)
+                .write(|w| w.set_teif(bit, true));
+            this.timer.stop();
+            this.timer.set_cc_dma_enable_state(this.channel, false);
+            this.irq_phase.store(IrqPhase::Error as u8, Ordering::Release);
+            return;
+        }
+
+        if !isr.tcif(bit) {
+            return;
+        }
+
+        regs.ifcr(D::stream_num() / 4)
+            .write(|w| w.set_tcif(bit, true));
+        this.timer.set_cc_dma_enable_state(this.channel, false);
+        dma_disable::<D>();
+
+        match this.irq_phase.load(Ordering::Acquire) {
+            x if x == IrqPhase::TxActive as u8 => {
+                apply_pacer_timer_config_fast(&this.timer, this.channel, this.rx_timer_cfg);
+                this.timer.reset();
+                dma_start_read::<D>(
+                    this.dma_request,
+                    this.pin.idr_ptr(),
+                    this.raw_samples.as_mut_ptr(),
+                    this.capture_cfg.sample_count,
+                );
+                this.pin.enter_input_pullup(this.capture_cfg.pull);
+                this.irq_phase.store(IrqPhase::RxActive as u8, Ordering::Release);
+                this.timer.set_cc_dma_enable_state(this.channel, true);
+                this.timer.start();
+            }
+            x if x == IrqPhase::RxActive as u8 => {
+                this.timer.stop();
+                this.timer.set_cc_dma_enable_state(this.channel, false);
+                this.irq_phase.store(IrqPhase::Done as u8, Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn configure_pacer_timer<T: GeneralInstance4Channel>(
     timer: &Timer<'_, T>,
     channel: Channel,
@@ -456,6 +952,18 @@ fn compute_pacer_timer_config<T: GeneralInstance4Channel>(
     }
 }
 
+fn compute_rx_timer_config<T: GeneralInstance4Channel>(
+    timer: &Timer<'_, T>,
+    speed: DshotSpeed,
+    runtime_cfg: BidirPortRuntimeConfig,
+    capture_cfg: BidirCaptureConfig,
+) -> PacerTimerConfig {
+    let tx_state_hz = speed.timing_hints().nominal_bitrate_hz * 3;
+    let rx_sample_hz =
+        tx_state_hz * 5 * 2 * capture_cfg.oversampling.oversampling as u32 / 24;
+    compute_pacer_timer_config(timer, rx_sample_hz, runtime_cfg.pacer_compare_percent)
+}
+
 fn dma_transfer_complete<D: RawDmaChannel>() -> bool {
     let regs = D::regs();
     let stream = D::stream_num();
@@ -512,6 +1020,76 @@ unsafe fn dma_start_write<D: RawDmaChannel>(
         w.set_pinc(false);
         w.set_teie(false);
         w.set_tcie(false);
+        w.set_htie(false);
+        w.set_circ(false);
+        w.set_chsel(request);
+        w.set_pburst(pac::dma::vals::Burst::SINGLE);
+        w.set_mburst(pac::dma::vals::Burst::SINGLE);
+        w.set_pfctrl(pac::dma::vals::Pfctrl::DMA);
+        w.set_en(true);
+    });
+}
+
+unsafe fn dma_start_write_irq<D: RawDmaChannel>(
+    request: Request,
+    mem_addr: *const u32,
+    peri_addr: *mut u32,
+    len: usize,
+) {
+    let regs = D::regs();
+    let st = regs.st(D::stream_num());
+    dma_disable::<D>();
+    dma_clear_flags::<D>();
+
+    st.par().write_value(peri_addr as u32);
+    st.m0ar().write_value(mem_addr as u32);
+    st.ndtr().write_value(pac::dma::regs::Ndtr(len as _));
+    st.fcr()
+        .write(|w| w.set_dmdis(pac::dma::vals::Dmdis::ENABLED));
+    st.cr().write(|w| {
+        w.set_dir(pac::dma::vals::Dir::MEMORY_TO_PERIPHERAL);
+        w.set_msize(pac::dma::vals::Size::BITS32);
+        w.set_psize(pac::dma::vals::Size::BITS32);
+        w.set_pl(pac::dma::vals::Pl::VERY_HIGH);
+        w.set_minc(true);
+        w.set_pinc(false);
+        w.set_teie(true);
+        w.set_tcie(true);
+        w.set_htie(false);
+        w.set_circ(false);
+        w.set_chsel(request);
+        w.set_pburst(pac::dma::vals::Burst::SINGLE);
+        w.set_mburst(pac::dma::vals::Burst::SINGLE);
+        w.set_pfctrl(pac::dma::vals::Pfctrl::DMA);
+        w.set_en(true);
+    });
+}
+
+unsafe fn dma_start_read<D: RawDmaChannel>(
+    request: Request,
+    peri_addr: *mut u16,
+    mem_addr: *mut u16,
+    len: usize,
+) {
+    let regs = D::regs();
+    let st = regs.st(D::stream_num());
+    dma_disable::<D>();
+    dma_clear_flags::<D>();
+
+    st.par().write_value(peri_addr as u32);
+    st.m0ar().write_value(mem_addr as u32);
+    st.ndtr().write_value(pac::dma::regs::Ndtr(len as _));
+    st.fcr()
+        .write(|w| w.set_dmdis(pac::dma::vals::Dmdis::ENABLED));
+    st.cr().write(|w| {
+        w.set_dir(pac::dma::vals::Dir::PERIPHERAL_TO_MEMORY);
+        w.set_msize(pac::dma::vals::Size::BITS16);
+        w.set_psize(pac::dma::vals::Size::BITS16);
+        w.set_pl(pac::dma::vals::Pl::VERY_HIGH);
+        w.set_minc(true);
+        w.set_pinc(false);
+        w.set_teie(true);
+        w.set_tcie(true);
         w.set_htie(false);
         w.set_circ(false);
         w.set_chsel(request);
