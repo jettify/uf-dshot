@@ -5,6 +5,7 @@
 mod fmt;
 
 use embassy_executor::Spawner;
+use embassy_stm32::gpio::Pull;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::watch::{Receiver, Sender, Watch};
 use embassy_time::{Duration, Ticker, Timer as EmbassyTimer};
@@ -12,7 +13,8 @@ use embassy_time::{Duration, Ticker, Timer as EmbassyTimer};
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use uf_dshot::embassy_stm32::{DshotTxPin, Stm32BidirCapture, Stm32BidirController};
+use uf_dshot::embassy_stm32::bidir_capture::{DshotPortPin, Stm32BidirPortController};
+use uf_dshot::embassy_stm32::Stm32BidirCapture;
 use uf_dshot::{DshotSpeed, OversamplingConfig};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
@@ -20,10 +22,22 @@ use {defmt_rtt as _, panic_probe as _};
 static MOTOR_THROTTLE: Watch<ThreadModeRawMutex, u16, 1> = Watch::new_with(0);
 
 const ARMING_DELAY_MS: u64 = 7_000;
-const TX_PERIOD_US: u64 = 70;
+// Bidir DShot300 needs enough time for the 16-bit command, ESC turnaround, and
+// the telemetry capture window. A 70 us loop overruns once capture is enabled,
+// which makes motor updates arrive with irregular cadence.
+const TX_PERIOD_US: u64 = 180;
 const TELEMETRY_LOG_EVERY_FRAMES: u32 = 20_000;
 const DEMO_THROTTLE_MAX_PERCENT: u16 = 25;
 const DSHOT_MAX_THROTTLE: u16 = 1_999;
+const PACER_COMPARE_PERCENT: u8 = 50;
+const RX_OVERSAMPLING: OversamplingConfig = OversamplingConfig {
+    sample_bit_index: 0,
+    oversampling: 6,
+    frame_bits: 21,
+    min_detected_bits: 18,
+    bit_tolerance: 2,
+};
+const RX_SAMPLE_COUNT: usize = 240;
 
 fn throttle_percent_to_raw(percent: u16) -> u16 {
     let clamped = percent.clamp(0, 100);
@@ -51,7 +65,7 @@ async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
 #[embassy_executor::task]
 async fn motor_task(
     mut controller:
-        Stm32BidirController<'static, embassy_stm32::peripherals::TIM1, embassy_stm32::peripherals::DMA2_CH5>,
+        Stm32BidirPortController<'static, embassy_stm32::peripherals::TIM1, embassy_stm32::peripherals::DMA2_CH1, 1>,
     mut receiver: Receiver<'static, ThreadModeRawMutex, u16, 1>,
 ) -> ! {
     unwrap!(controller.arm().await);
@@ -67,8 +81,8 @@ async fn motor_task(
         throttle_percent = receiver.try_get().unwrap_or(throttle_percent);
 
         let raw_throttle = throttle_percent_to_raw(throttle_percent);
-        match controller.send_throttle_and_receive(raw_throttle).await {
-            Ok(frame) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
+        match controller.send_throttles_and_receive([raw_throttle]).await {
+            Ok([Ok(frame)]) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
                 info!(
                     "telemetry throttle={} raw={} value={:?}",
                     throttle_percent,
@@ -76,9 +90,17 @@ async fn motor_task(
                     frame
                 );
             }
+            Ok([Err(err)]) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
+                info!(
+                    "telemetry decode err throttle={} raw={} err={:?}",
+                    throttle_percent,
+                    raw_throttle,
+                    err
+                );
+            }
             Err(err) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
                 info!(
-                    "telemetry err throttle={} raw={} err={:?}",
+                    "telemetry io err throttle={} raw={} err={:?}",
                     throttle_percent,
                     raw_throttle,
                     err
@@ -92,7 +114,7 @@ async fn motor_task(
 }
 
 embassy_stm32::bind_interrupts!(struct DmaIrqs {
-    DMA2_STREAM5 => embassy_stm32::dma::InterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
+    DMA2_STREAM1 => uf_dshot::embassy_stm32::bidir_capture::InterruptHandler<embassy_stm32::peripherals::DMA2_CH1>;
 });
 
 #[embassy_executor::main]
@@ -100,13 +122,16 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     // Adjust timer/DMA/pin mapping here to match your board.
-    let tx_pin = DshotTxPin::new_ch1(p.PA8);
-    let rx_cfg = Stm32BidirCapture::new(OversamplingConfig::default());
-    let controller = unwrap!(Stm32BidirController::bidirectional(
+    let motor_pin = DshotPortPin::new(p.PA8);
+    let rx_cfg = Stm32BidirCapture::new(RX_OVERSAMPLING)
+        .with_sample_count(RX_SAMPLE_COUNT)
+        .with_pull(Pull::None)
+        .with_pacer_compare_percent(PACER_COMPARE_PERCENT);
+    let controller = unwrap!(Stm32BidirPortController::new_ch1(
         p.TIM1,
-        tx_pin,
-        p.DMA2_CH5,
+        p.DMA2_CH1,
         DmaIrqs,
+        [motor_pin],
         rx_cfg,
         DshotSpeed::Dshot300,
     ));

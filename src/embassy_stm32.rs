@@ -1,5 +1,10 @@
 //! Experimental Embassy STM32 runtime API for single-line DShot.
 
+#[path = "embassy_stm32_bf_compat.rs"]
+pub mod bf_port;
+#[path = "embassy_stm32_bidir_capture.rs"]
+pub mod bidir_capture;
+
 use core::marker::PhantomData;
 
 use embassy_stm32_hal::dma::{
@@ -24,8 +29,12 @@ use crate::telemetry::{
 const TX_BUFFER_SLOTS: usize = 17;
 const MAX_CAPTURE_SAMPLES: usize = 512;
 const PINS_PER_GPIO_PORT: u8 = 16;
-// docs/stm32.rs samples a 100-slot logic-analyzer window for bidirectional telemetry.
-const PREAMBLE_MARGIN_SAMPLES: usize = 37;
+// The ESC turnaround before bidirectional telemetry can exceed 40 us on AM32 setups.
+// Keep enough leading idle-high samples so the default capture window still contains
+// the full 21-bit telemetry frame at DShot300 with 3x oversampling.
+const PREAMBLE_MARGIN_SAMPLES: usize = 64;
+#[cfg(feature = "defmt")]
+const RX_PROGRESS_PROBE_DELAY_US: u64 = 10;
 const DEFAULT_ARM_DURATION: Duration = Duration::from_millis(3_000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,11 +185,13 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Stm32BidirCapture {
     oversampling: OversamplingConfig,
     sample_count: usize,
     decode_hint: DecodeHint,
     pull: Pull,
+    pacer_compare_percent: u8,
     preamble_tuning: PreambleTuningConfig,
     timeouts: RuntimeTimeouts,
 }
@@ -194,6 +205,7 @@ impl Stm32BidirCapture {
             sample_count,
             decode_hint: DecodeHint::default(),
             pull: Pull::Up,
+            pacer_compare_percent: 50,
             preamble_tuning: PreambleTuningConfig::default(),
             timeouts: RuntimeTimeouts::default(),
         }
@@ -211,6 +223,11 @@ impl Stm32BidirCapture {
 
     pub fn with_pull(mut self, pull: Pull) -> Self {
         self.pull = pull;
+        self
+    }
+
+    pub fn with_pacer_compare_percent(mut self, percent: u8) -> Self {
+        self.pacer_compare_percent = percent.clamp(1, 99);
         self
     }
 
@@ -938,11 +955,6 @@ fn stop_tx_timer<T: GeneralInstance4Channel>(timer: &Timer<'_, T>, channel: Chan
     timer.enable_channel(channel, false);
 }
 
-fn bit_period_duration(speed: DshotSpeed) -> Duration {
-    let bitrate_hz = u64::from(speed.timing_hints().nominal_bitrate_hz);
-    Duration::from_micros(1_000_000_u64.div_ceil(bitrate_hz))
-}
-
 struct RxSampleTimerGuard<'a, T>
 where
     T: GeneralInstance4Channel,
@@ -958,8 +970,12 @@ where
         timer.stop();
         timer.enable_update_dma(false);
         timer.reset();
+        let _ = timer.clear_update_interrupt();
         timer.set_frequency(Hertz(sample_hz), RoundTo::Faster);
-        timer.generate_update_event();
+        // `set_frequency` already emits an update event to latch PSC/ARR. Clear the
+        // resulting pending update state before arming DMA so RX capture starts from
+        // timer-paced requests instead of immediately consuming buffered software UGs.
+        let _ = timer.clear_update_interrupt();
         timer.enable_update_dma(true);
 
         Self { timer }
@@ -995,24 +1011,113 @@ where
     let timer_guard = RxSampleTimerGuard::new(timer, sample_hz);
 
     let options = TransferOptions::default();
-    let rx_result = unsafe {
+    #[cfg(feature = "defmt")]
+    let cnt_before_start = timer.regs_gp16().cnt().read().cnt();
+    #[cfg(feature = "defmt")]
+    let update_dma_before_start = timer.get_update_dma_state();
+
+    let mut transfer = unsafe {
         // SAFETY: DMA reads from the GPIO IDR register for the lifetime of `tx_pin`, writes into
         // `buffer` for the duration of the transfer, and `dma` is exclusively borrowed here.
         // Embassy's DMA API takes a `*mut` peripheral address for `read_raw`, even though GPIO IDR
         // is a read-only register and this transfer only reads from it.
-        let transfer = dma.read_raw(
+        dma.read_raw(
             dma_request,
             tx_pin.idr_ptr() as *mut u32,
             buffer as *mut [u32],
             options,
-        );
-        timer_guard.start();
-        with_timeout(timeout, transfer).await
+        )
     };
 
+    #[cfg(feature = "defmt")]
+    {
+        defmt::debug!(
+            "bdshot rx arm req={} sample_hz={} count={} timeout_us={} ude={} cnt={}",
+            dma_request,
+            sample_hz,
+            buffer.len(),
+            timeout.as_micros() as u64,
+            update_dma_before_start,
+            cnt_before_start,
+        );
+    }
+
+    timer_guard.start();
+
+    #[cfg(feature = "defmt")]
+    {
+        let cnt_after_start = timer.regs_gp16().cnt().read().cnt();
+        defmt::debug!(
+            "bdshot rx start req={} ude={} cnt={} remaining={}",
+            dma_request,
+            timer.get_update_dma_state(),
+            cnt_after_start,
+            transfer.get_remaining_transfers(),
+        );
+
+        EmbassyTimer::after(Duration::from_micros(RX_PROGRESS_PROBE_DELAY_US)).await;
+
+        let running = transfer.is_running();
+        let remaining = transfer.get_remaining_transfers();
+        let transferred = buffer.len().saturating_sub(remaining as usize);
+        let cnt_probe = timer.regs_gp16().cnt().read().cnt();
+        defmt::debug!(
+            "bdshot rx probe delay_us={} req={} running={} remaining={} transferred={} ude={} cnt={}",
+            RX_PROGRESS_PROBE_DELAY_US,
+            dma_request,
+            running,
+            remaining,
+            transferred,
+            timer.get_update_dma_state(),
+            cnt_probe,
+        );
+    }
+
+    let rx_result = with_timeout(timeout, &mut transfer).await;
+
     match rx_result {
-        Ok(()) => Ok(()),
-        Err(_) => Err(Stm32RuntimeError::RxTimeout),
+        Ok(()) => {
+            #[cfg(feature = "defmt")]
+            {
+                let remaining = transfer.get_remaining_transfers();
+                let changed_samples = buffer
+                    .iter()
+                    .skip(1)
+                    .filter(|&&sample| sample != buffer[0])
+                    .count();
+                defmt::debug!(
+                    "bdshot rx done req={} remaining={} changed={} first=0x{:08x} last=0x{:08x}",
+                    dma_request,
+                    remaining,
+                    changed_samples,
+                    buffer.first().copied().unwrap_or(0),
+                    buffer.last().copied().unwrap_or(0),
+                );
+            }
+            Ok(())
+        }
+        Err(_) => {
+            #[cfg(feature = "defmt")]
+            {
+                let running = transfer.is_running();
+                let remaining = transfer.get_remaining_transfers();
+                let changed_samples = buffer
+                    .iter()
+                    .skip(1)
+                    .filter(|&&sample| sample != buffer[0])
+                    .count();
+                defmt::warn!(
+                    "bdshot rx timeout req={} running={} remaining={} changed={} first=0x{:08x} last=0x{:08x}",
+                    dma_request,
+                    running,
+                    remaining,
+                    changed_samples,
+                    buffer.first().copied().unwrap_or(0),
+                    buffer.last().copied().unwrap_or(0),
+                );
+            }
+            Err(Stm32RuntimeError::RxTimeout)
+        }
     }
 }
 
