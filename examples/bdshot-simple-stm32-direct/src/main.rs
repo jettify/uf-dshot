@@ -3,7 +3,6 @@
 
 #[macro_use]
 mod fmt;
-mod bidir_capture;
 #[path = "embassy_stm32.rs"]
 mod embassy_stm32_local;
 
