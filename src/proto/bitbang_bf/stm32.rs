@@ -14,7 +14,12 @@ use embassy_stm32_hal::timer::{
 use embassy_stm32_hal::Peri;
 use embassy_time::{Duration, Instant, Timer as EmbassyTimer};
 
-use crate::bidir_capture::decode_frame_bf_port_samples_u16;
+#[cfg(not(feature = "defmt"))]
+use crate::bidir_capture::decode_frame_bf_strict_port_samples_u16;
+#[cfg(feature = "defmt")]
+use crate::bidir_capture::{
+    decode_bf_raw_21, decode_frame_bf_strict_port_samples_with_debug_u16,
+};
 use crate::proto::bitbang_bf::{build_port_words, PortFrameError, SignalPolarity, TX_STATE_SLOTS};
 use crate::telemetry::{
     BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
@@ -92,6 +97,13 @@ struct PacerTimerConfig {
     psc: u16,
     arr: u16,
     compare: u16,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedRxDmaConfig {
+    request: Request,
+    peri_addr: *mut u16,
+    len: usize,
 }
 
 pub trait RawDmaChannel: DmaChannelInstance {
@@ -244,6 +256,8 @@ pub struct BidirPortRuntimeConfig {
     pub tx_timeout: Duration,
     pub rx_timeout: Duration,
     pub pacer_compare_percent: u8,
+    pub rx_compare_percent: u8,
+    pub rx_sample_percent: u8,
 }
 
 impl Default for BidirPortRuntimeConfig {
@@ -252,6 +266,8 @@ impl Default for BidirPortRuntimeConfig {
             tx_timeout: Duration::from_millis(2),
             rx_timeout: Duration::from_millis(2),
             pacer_compare_percent: 50,
+            rx_compare_percent: 50,
+            rx_sample_percent: 100,
         }
     }
 }
@@ -541,10 +557,25 @@ where
     capture_cfg: BidirCaptureConfig,
     tx_timer_cfg: PacerTimerConfig,
     rx_timer_cfg: PacerTimerConfig,
+    rx_dma_cfg: PreparedRxDmaConfig,
     decoder: BidirDecoder,
     tx_words: [u32; TX_STATE_SLOTS],
     raw_samples: [u16; MAX_CAPTURE_SAMPLES],
     irq_phase: AtomicU8,
+    #[cfg(feature = "defmt")]
+    capture_attempts: u32,
+    #[cfg(feature = "defmt")]
+    decode_error_count: u32,
+    #[cfg(feature = "defmt")]
+    tx_irq_started_at: Instant,
+    #[cfg(feature = "defmt")]
+    last_tx_done_irq_us: u32,
+    #[cfg(feature = "defmt")]
+    last_rx_armed_irq_us: u32,
+    #[cfg(feature = "defmt")]
+    last_rx_handoff_us: u32,
+    #[cfg(feature = "defmt")]
+    last_rx_capture_us: u32,
     _dma: PhantomData<D>,
 }
 
@@ -610,15 +641,20 @@ where
     }
 
     pub fn with_runtime_config(mut self, runtime_cfg: BidirPortRuntimeConfig) -> Self {
+        self.set_runtime_config(runtime_cfg);
+        self
+    }
+
+    pub fn set_runtime_config(&mut self, runtime_cfg: BidirPortRuntimeConfig) {
         self.runtime_cfg = runtime_cfg;
         self.tx_timer_cfg = compute_pacer_timer_config(
             &self.timer,
             self.speed.timing_hints().nominal_bitrate_hz * 3,
             runtime_cfg.pacer_compare_percent,
         );
-        self.rx_timer_cfg = compute_rx_timer_config(&self.timer, self.speed, runtime_cfg, self.capture_cfg);
+        self.rx_timer_cfg =
+            compute_rx_timer_config(&self.timer, self.speed, runtime_cfg, self.capture_cfg);
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
-        self
     }
 
     fn new_inner<C>(
@@ -654,6 +690,7 @@ where
         let rx_timer_cfg = compute_rx_timer_config(&timer, speed, runtime_cfg, capture_cfg);
         configure_pacer_timer(&timer, C::CHANNEL, tx_timer_cfg);
         pin.enter_input_pullup(capture_cfg.pull);
+        let pin_idr_ptr = pin.idr_ptr();
 
         let mut decoder =
             BidirDecoder::with_preamble_tuning(capture_cfg.oversampling, capture_cfg.preamble_tuning);
@@ -669,10 +706,29 @@ where
             capture_cfg,
             tx_timer_cfg,
             rx_timer_cfg,
+            rx_dma_cfg: PreparedRxDmaConfig {
+                request: dma_request,
+                peri_addr: pin_idr_ptr,
+                len: capture_cfg.sample_count,
+            },
             decoder,
             tx_words: [0; TX_STATE_SLOTS],
             raw_samples: [0; MAX_CAPTURE_SAMPLES],
             irq_phase: AtomicU8::new(IrqPhase::Idle as u8),
+            #[cfg(feature = "defmt")]
+            capture_attempts: 0,
+            #[cfg(feature = "defmt")]
+            decode_error_count: 0,
+            #[cfg(feature = "defmt")]
+            tx_irq_started_at: Instant::from_ticks(0),
+            #[cfg(feature = "defmt")]
+            last_tx_done_irq_us: 0,
+            #[cfg(feature = "defmt")]
+            last_rx_armed_irq_us: 0,
+            #[cfg(feature = "defmt")]
+            last_rx_handoff_us: 0,
+            #[cfg(feature = "defmt")]
+            last_rx_capture_us: 0,
             _dma: PhantomData,
         })
     }
@@ -729,7 +785,98 @@ where
         .words;
         self.run_tx_then_capture().await?;
 
-        Ok(decode_frame_bf_port_samples_u16(
+        #[cfg(feature = "defmt")]
+        {
+            self.capture_attempts = self.capture_attempts.wrapping_add(1);
+            let samples = &self.raw_samples[..self.capture_cfg.sample_count];
+            let outcome = decode_frame_bf_strict_port_samples_with_debug_u16(
+                &mut self.decoder,
+                samples,
+                self.pin.pin_mask() as u16,
+            );
+
+            if outcome.salvaged
+                && (self.capture_attempts <= 8 || self.capture_attempts % 256 == 0)
+            {
+                defmt::info!(
+                    "proto bdshot salvage attempts={} bf_start={} bf_end={} bf_bits={} bf_raw=0x{:06x}",
+                    self.capture_attempts,
+                    outcome.debug.start_margin,
+                    outcome.debug.frame_end,
+                    outcome.debug.bits_found,
+                    outcome.debug.raw_21,
+                );
+            }
+
+            if let Err(err) = outcome.frame {
+                self.decode_error_count = self.decode_error_count.wrapping_add(1);
+                let count = self.decode_error_count;
+                if count <= 8 || count % 256 == 0 {
+                    let summary = summarize_port_samples(samples, self.pin.pin_mask() as u16);
+                    let stats = self.decoder.stats();
+                    let (bf_raw_valid, bf_payload) = if outcome.debug.raw_21 != 0 {
+                        match decode_bf_raw_21(&self.decoder, outcome.debug.raw_21) {
+                            Ok(payload) => (true, payload.raw_16 as u32),
+                            Err(_) => (false, 0),
+                        }
+                    } else {
+                        (false, 0)
+                    };
+                    defmt::warn!(
+                        "proto bdshot decode err attempts={} count={} err={} tx_done_irq_us={} rx_armed_irq_us={} handoff_us={} capture_us={} highs={} lows={} first_low={:?} edges={} first_edge={:?} last_edge={:?} hint_skip={} stats ok={} no_edge={} short={} invalid_frame={} invalid_gcr={} invalid_crc={} start_margin={} bf_start={} bf_end={} bf_bits={} bf_raw=0x{:06x} bf_raw_valid={} bf_payload=0x{:04x} bf_runs={},{},{},{},{},{},{},{},{},{},{},{} raw_head=0x{:04x},0x{:04x},0x{:04x},0x{:04x}",
+                        self.capture_attempts,
+                        count,
+                        err,
+                        self.last_tx_done_irq_us,
+                        self.last_rx_armed_irq_us,
+                        self.last_rx_handoff_us,
+                        self.last_rx_capture_us,
+                        summary.high_count,
+                        summary.low_count,
+                        summary.first_low,
+                        summary.edge_count,
+                        summary.first_edge,
+                        summary.last_edge,
+                        self.decoder.stream_hint().preamble_skip,
+                        stats.successful_frames,
+                        stats.no_edge,
+                        stats.frame_too_short,
+                        stats.invalid_frame,
+                        stats.invalid_gcr_symbol,
+                        stats.invalid_crc,
+                        stats.last_start_margin,
+                        outcome.debug.start_margin,
+                        outcome.debug.frame_end,
+                        outcome.debug.bits_found,
+                        outcome.debug.raw_21,
+                        bf_raw_valid,
+                        bf_payload,
+                        outcome.debug.runs[0],
+                        outcome.debug.runs[1],
+                        outcome.debug.runs[2],
+                        outcome.debug.runs[3],
+                        outcome.debug.runs[4],
+                        outcome.debug.runs[5],
+                        outcome.debug.runs[6],
+                        outcome.debug.runs[7],
+                        outcome.debug.runs[8],
+                        outcome.debug.runs[9],
+                        outcome.debug.runs[10],
+                        outcome.debug.runs[11],
+                        samples.first().copied().unwrap_or(0) as u32,
+                        samples.get(1).copied().unwrap_or(0) as u32,
+                        samples.get(2).copied().unwrap_or(0) as u32,
+                        samples.get(3).copied().unwrap_or(0) as u32,
+                    );
+                }
+                return Ok(Err(err));
+            }
+
+            return Ok(outcome.frame);
+        }
+
+        #[cfg(not(feature = "defmt"))]
+        Ok(decode_frame_bf_strict_port_samples_u16(
             &mut self.decoder,
             &self.raw_samples[..self.capture_cfg.sample_count],
             self.pin.pin_mask() as u16,
@@ -791,6 +938,14 @@ where
         self.timer.reset();
         self.irq_phase.store(IrqPhase::TxActive as u8, Ordering::Release);
         self.pin.enter_output_high();
+        #[cfg(feature = "defmt")]
+        {
+            self.tx_irq_started_at = Instant::now();
+            self.last_tx_done_irq_us = 0;
+            self.last_rx_armed_irq_us = 0;
+            self.last_rx_handoff_us = 0;
+            self.last_rx_capture_us = 0;
+        }
 
         unsafe {
             self.register_irq_callback();
@@ -809,6 +964,12 @@ where
         loop {
             match self.irq_phase.load(Ordering::Acquire) {
                 x if x == IrqPhase::Done as u8 => {
+                    #[cfg(feature = "defmt")]
+                    {
+                        self.last_rx_handoff_us = self
+                            .last_rx_armed_irq_us
+                            .saturating_sub(self.last_tx_done_irq_us);
+                    }
                     self.clear_irq_callback();
                     return Ok(());
                 }
@@ -869,22 +1030,40 @@ where
 
         match this.irq_phase.load(Ordering::Acquire) {
             x if x == IrqPhase::TxActive as u8 => {
-                apply_pacer_timer_config_fast(&this.timer, this.channel, this.rx_timer_cfg);
-                this.timer.reset();
-                dma_start_read::<D>(
-                    this.dma_request,
-                    this.pin.idr_ptr(),
-                    this.raw_samples.as_mut_ptr(),
-                    this.capture_cfg.sample_count,
-                );
+                #[cfg(feature = "defmt")]
+                {
+                    this.last_tx_done_irq_us = Instant::now()
+                        .saturating_duration_since(this.tx_irq_started_at)
+                        .as_micros() as u32;
+                }
+
+                // Release the line immediately after TX DMA completion so the ESC can seize it
+                // while we reconfigure the timer and DMA for RX sampling.
                 this.pin.enter_input_pullup(this.capture_cfg.pull);
+                switch_pacer_timer_config_fast(&this.timer, this.channel, this.rx_timer_cfg);
+                dma_start_prepared_read_no_reset::<D>(
+                    this.rx_dma_cfg,
+                    this.raw_samples.as_mut_ptr(),
+                );
                 this.irq_phase.store(IrqPhase::RxActive as u8, Ordering::Release);
                 this.timer.set_cc_dma_enable_state(this.channel, true);
-                this.timer.start();
+                #[cfg(feature = "defmt")]
+                {
+                    this.last_rx_armed_irq_us = Instant::now()
+                        .saturating_duration_since(this.tx_irq_started_at)
+                        .as_micros() as u32;
+                }
             }
             x if x == IrqPhase::RxActive as u8 => {
                 this.timer.stop();
                 this.timer.set_cc_dma_enable_state(this.channel, false);
+                #[cfg(feature = "defmt")]
+                {
+                    let now_us = Instant::now()
+                        .saturating_duration_since(this.tx_irq_started_at)
+                        .as_micros() as u32;
+                    this.last_rx_capture_us = now_us.saturating_sub(this.last_rx_armed_irq_us);
+                }
                 this.irq_phase.store(IrqPhase::Done as u8, Ordering::Release);
             }
             _ => {}
@@ -920,6 +1099,21 @@ fn apply_pacer_timer_config_fast<T: GeneralInstance4Channel>(
     timer.set_compare_value(channel, cfg.compare.into());
     timer.generate_update_event();
     let _ = timer.clear_update_interrupt();
+}
+
+fn switch_pacer_timer_config_fast<T: GeneralInstance4Channel>(
+    timer: &Timer<'_, T>,
+    channel: Channel,
+    cfg: PacerTimerConfig,
+) {
+    let regs = timer.regs_gp16();
+
+    if regs.psc().read() != cfg.psc {
+        regs.psc().write_value(cfg.psc);
+    }
+    regs.arr().write(|r| r.set_arr(cfg.arr.into()));
+    timer.set_compare_value(channel, cfg.compare.into());
+    timer.generate_update_event();
 }
 
 fn compute_pacer_timer_config<T: GeneralInstance4Channel>(
@@ -958,10 +1152,82 @@ fn compute_rx_timer_config<T: GeneralInstance4Channel>(
     runtime_cfg: BidirPortRuntimeConfig,
     capture_cfg: BidirCaptureConfig,
 ) -> PacerTimerConfig {
-    let tx_state_hz = speed.timing_hints().nominal_bitrate_hz * 3;
-    let rx_sample_hz =
-        tx_state_hz * 5 * 2 * capture_cfg.oversampling.oversampling as u32 / 24;
-    compute_pacer_timer_config(timer, rx_sample_hz, runtime_cfg.pacer_compare_percent)
+    // Match Betaflight's telemetry input pacing:
+    // inputFreq = outputFreq * 5 * 2 * oversample / 24
+    // For the BF default oversample=3, this becomes outputFreq * 5 / 4.
+    let symbol_rate_hz = speed.timing_hints().nominal_bitrate_hz;
+    let mut rx_sample_hz =
+        symbol_rate_hz * 5 * capture_cfg.oversampling.oversampling as u32 / 4;
+    rx_sample_hz = rx_sample_hz
+        .saturating_mul(runtime_cfg.rx_sample_percent.clamp(1, 200) as u32)
+        / 100;
+    compute_pacer_timer_config(timer, rx_sample_hz, runtime_cfg.rx_compare_percent)
+}
+
+#[cfg(feature = "defmt")]
+struct SampleSummary {
+    high_count: usize,
+    low_count: usize,
+    edge_count: usize,
+    first_low: Option<usize>,
+    first_edge: Option<usize>,
+    last_edge: Option<usize>,
+}
+
+#[cfg(feature = "defmt")]
+fn summarize_levels<I>(iter: I) -> SampleSummary
+where
+    I: Iterator<Item = bool>,
+{
+    let mut high_count = 0usize;
+    let mut low_count = 0usize;
+    let mut edge_count = 0usize;
+    let mut first_low = None;
+    let mut first_edge = None;
+    let mut last_edge = None;
+    let mut prev = None;
+
+    for (idx, level) in iter.enumerate() {
+        if level {
+            high_count += 1;
+        } else {
+            low_count += 1;
+            if first_low.is_none() {
+                first_low = Some(idx);
+            }
+        }
+
+        if let Some(prev_level) = prev {
+            if prev_level != level {
+                edge_count += 1;
+                if first_edge.is_none() {
+                    first_edge = Some(idx);
+                }
+                last_edge = Some(idx);
+            }
+        }
+
+        prev = Some(level);
+    }
+
+    SampleSummary {
+        high_count,
+        low_count,
+        edge_count,
+        first_low,
+        first_edge,
+        last_edge,
+    }
+}
+
+#[cfg(feature = "defmt")]
+fn summarize_port_samples(samples: &[u16], bit_mask: u16) -> SampleSummary {
+    summarize_levels(
+        samples
+            .iter()
+            .copied()
+            .map(|sample| (sample & bit_mask) != 0),
+    )
 }
 
 fn dma_transfer_complete<D: RawDmaChannel>() -> bool {
@@ -1065,20 +1331,16 @@ unsafe fn dma_start_write_irq<D: RawDmaChannel>(
     });
 }
 
-unsafe fn dma_start_read<D: RawDmaChannel>(
-    request: Request,
-    peri_addr: *mut u16,
+unsafe fn dma_start_prepared_read_no_reset<D: RawDmaChannel>(
+    cfg: PreparedRxDmaConfig,
     mem_addr: *mut u16,
-    len: usize,
 ) {
     let regs = D::regs();
     let st = regs.st(D::stream_num());
-    dma_disable::<D>();
-    dma_clear_flags::<D>();
 
-    st.par().write_value(peri_addr as u32);
+    st.par().write_value(cfg.peri_addr as u32);
     st.m0ar().write_value(mem_addr as u32);
-    st.ndtr().write_value(pac::dma::regs::Ndtr(len as _));
+    st.ndtr().write_value(pac::dma::regs::Ndtr(cfg.len as _));
     st.fcr()
         .write(|w| w.set_dmdis(pac::dma::vals::Dmdis::ENABLED));
     st.cr().write(|w| {
@@ -1092,7 +1354,7 @@ unsafe fn dma_start_read<D: RawDmaChannel>(
         w.set_tcie(true);
         w.set_htie(false);
         w.set_circ(false);
-        w.set_chsel(request);
+        w.set_chsel(cfg.request);
         w.set_pburst(pac::dma::vals::Burst::SINGLE);
         w.set_mburst(pac::dma::vals::Burst::SINGLE);
         w.set_pfctrl(pac::dma::vals::Pfctrl::DMA);

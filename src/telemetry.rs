@@ -674,7 +674,7 @@ const GCR_DECODE_TABLE: [u8; 32] = [
 ];
 
 pub fn decode_gcr(gcr_value: u32) -> Option<u16> {
-    let gcr_encoded = (gcr_value ^ (gcr_value >> 1)) & 0xFFFFF;
+    let gcr_encoded = gcr_value & 0xFFFFF;
 
     let mut result: u16 = 0;
     let mut i = 0;
@@ -705,17 +705,7 @@ pub fn encode_gcr(payload: u16) -> u32 {
         i += 1;
     }
 
-    let mut gcr_value: u32 = 1 << 20;
-    let mut last_bit = 1;
-    i = 0;
-    while i < 20 {
-        let gcr_bit = (gcr_encoded >> (19 - i)) & 1;
-        let current_bit = last_bit ^ gcr_bit;
-        gcr_value |= current_bit << (19 - i);
-        last_bit = current_bit;
-        i += 1;
-    }
-    gcr_value
+    gcr_encoded | (1 << 20)
 }
 
 fn decode_gcr_from_samples_cfg(
@@ -922,17 +912,7 @@ mod tests {
     }
 
     fn gcr_raw_from_encoded_20(gcr_encoded: u32) -> u32 {
-        let mut gcr_value: u32 = 1 << 20;
-        let mut last_bit = 1;
-        let mut i = 0;
-        while i < 20 {
-            let gcr_bit = (gcr_encoded >> (19 - i)) & 1;
-            let current_bit = last_bit ^ gcr_bit;
-            gcr_value |= current_bit << (19 - i);
-            last_bit = current_bit;
-            i += 1;
-        }
-        gcr_value
+        gcr_encoded | (1 << 20)
     }
 
     fn pulse_lengths_from_gcr(mut gcr: u32) -> ([usize; 21], usize) {
@@ -963,6 +943,15 @@ mod tests {
         }
 
         (out, out_len)
+    }
+
+    #[test]
+    fn bf_raw_candidate_15ea6f_decodes_to_valid_erpm() {
+        let decoder = BidirDecoder::new(OversamplingConfig::default());
+        // 0x15ea6f is the raw_21 value from the reported error log.
+        // It should decode to 0xB83F which is a valid telemetry frame.
+        let payload = decoder.decode_payload(GcrFrame { raw_21: 0x15ea6f }).unwrap();
+        assert_eq!(payload.raw_16, 0xB83F);
     }
 
     #[test]

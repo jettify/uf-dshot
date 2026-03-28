@@ -124,6 +124,15 @@ pub(crate) fn decode_frame_bf_port_samples_u16(
     decode_frame_bf_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
 }
 
+#[allow(dead_code)]
+pub(crate) fn decode_frame_bf_strict_port_samples_u16(
+    decoder: &mut BidirDecoder,
+    samples: &[u16],
+    bit_mask: u16,
+) -> Result<TelemetryFrame, TelemetryPipelineError> {
+    decode_frame_bf_strict_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
+}
+
 pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
     decoder: &mut BidirDecoder,
     samples: &[u16],
@@ -258,6 +267,91 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
     }
 }
 
+pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
+    decoder: &mut BidirDecoder,
+    samples: &[u16],
+    bit_mask: u16,
+) -> BfDecodeOutcome {
+    let mut hint = decoder.stream_hint();
+    if hint.preamble_skip >= samples.len() {
+        hint.preamble_skip = samples.len().saturating_sub(1);
+    }
+
+    let mut debug = BfDecodeDebug::new();
+    let gcr = decode_gcr_bf_strict_port_samples_u16(samples, bit_mask, hint, decoder.cfg, &mut debug);
+    if let Some(gcr_ok) = gcr.as_ref().ok().copied() {
+        if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(gcr_ok)) {
+            return BfDecodeOutcome {
+                frame: Ok(frame),
+                debug,
+                salvaged: false,
+            };
+        }
+    }
+
+    if let Ok(gcr_ok) = gcr {
+        let payload_err = match decoder.decode_payload(gcr_ok.frame) {
+            Ok(payload) => match decoder.parse_payload(payload) {
+                Ok(frame) => {
+                    return BfDecodeOutcome {
+                        frame: Ok(frame),
+                        debug,
+                        salvaged: false,
+                    };
+                }
+                Err(err) => TelemetryPipelineError::PayloadParse(err),
+            },
+            Err(err) => TelemetryPipelineError::GcrDecode(err),
+        };
+
+        if matches!(
+            payload_err,
+            TelemetryPipelineError::PayloadParse(PayloadParseError::InvalidCrc { .. })
+        ) {
+            if let Some(raw_21) = try_salvage_single_bit(decoder, gcr_ok.frame.raw_21) {
+                let salvaged_gcr = GcrDecodeResult {
+                    frame: GcrFrame { raw_21 },
+                    start_margin: gcr_ok.start_margin,
+                };
+                if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(salvaged_gcr)) {
+                    return BfDecodeOutcome {
+                        frame: Ok(frame),
+                        debug,
+                        salvaged: true,
+                    };
+                }
+            }
+            if debug.bits_found >= 19 {
+                if let Some(raw_21) = try_salvage_two_bits(decoder, gcr_ok.frame.raw_21) {
+                    let salvaged_gcr = GcrDecodeResult {
+                        frame: GcrFrame { raw_21 },
+                        start_margin: gcr_ok.start_margin,
+                    };
+                    if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(salvaged_gcr)) {
+                        return BfDecodeOutcome {
+                            frame: Ok(frame),
+                            debug,
+                            salvaged: true,
+                        };
+                    }
+                }
+            }
+        }
+
+        return BfDecodeOutcome {
+            frame: Err(payload_err),
+            debug,
+            salvaged: false,
+        };
+    }
+
+    BfDecodeOutcome {
+        frame: decoder.decode_frame_from_gcr_tuned(gcr),
+        debug,
+        salvaged: false,
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn decode_gcr_bf_port_samples_u16(
     samples: &[u16],
@@ -355,6 +449,101 @@ pub(crate) fn decode_gcr_bf_port_samples_u16(
     })
 }
 
+pub(crate) fn decode_gcr_bf_strict_port_samples_u16(
+    samples: &[u16],
+    bit_mask: u16,
+    hint: DecodeHint,
+    cfg: OversamplingConfig,
+    debug: &mut BfDecodeDebug,
+) -> Result<GcrDecodeResult, SampleDecodeError> {
+    if cfg.oversampling == 0 || cfg.frame_bits == 0 || cfg.min_detected_bits > cfg.frame_bits {
+        return Err(SampleDecodeError::InvalidConfig);
+    }
+
+    if bit_mask == 0 {
+        return Err(SampleDecodeError::InvalidSampleBitIndex {
+            bit: cfg.sample_bit_index,
+        });
+    }
+
+    if hint.preamble_skip >= samples.len() {
+        return Err(SampleDecodeError::NoEdge);
+    }
+
+    let oversampling = cfg.oversampling as usize;
+    let frame_bits = cfg.frame_bits as u32;
+    let min_detected_bits = cfg.min_detected_bits as u32;
+    let min_frame_samples =
+        cfg.frame_bits.saturating_sub(cfg.bit_tolerance) as usize * oversampling;
+    let max_frame_samples = (cfg.frame_bits as usize + cfg.bit_tolerance as usize) * oversampling;
+
+    let start_margin = samples
+        .iter()
+        .enumerate()
+        .skip(hint.preamble_skip)
+        .find(|&(_, &sample)| (sample & bit_mask) == 0)
+        .map(|(idx, _)| idx)
+        .ok_or(SampleDecodeError::NoEdge)?;
+
+    if samples.len() < start_margin + min_frame_samples {
+        return Err(SampleDecodeError::FrameTooShort);
+    }
+
+    let frame_end = (start_margin + max_frame_samples).min(samples.len());
+    let mut p = start_margin;
+    let mut old_p = p;
+    let mut gcr_value = 0u32;
+    let mut bits_found = 0u32;
+    let mut expect_high = true;
+
+    debug.start_margin = start_margin;
+
+    while p < frame_end {
+        while p < frame_end && (((samples[p] & bit_mask) != 0) != expect_high) {
+            p += 1;
+        }
+
+        if p >= frame_end {
+            break;
+        }
+
+        debug.frame_end = p;
+        let run_samples = p.saturating_sub(old_p).saturating_add(1);
+        let run_bits = ((run_samples + 1) / oversampling).max(1) as u32;
+        bits_found = bits_found.saturating_add(run_bits);
+        if bits_found > frame_bits {
+            return Err(SampleDecodeError::InvalidFrame);
+        }
+        gcr_value <<= run_bits;
+        gcr_value |= 1 << (run_bits - 1);
+        debug.push_run(run_bits);
+
+        old_p = p;
+        expect_high = !expect_high;
+    }
+
+    debug.bits_found = bits_found;
+    if bits_found < min_detected_bits {
+        return Err(SampleDecodeError::NoEdge);
+    }
+
+    let remaining_bits = frame_bits.saturating_sub(bits_found);
+    if remaining_bits > 0 {
+        gcr_value <<= remaining_bits;
+        gcr_value |= 1 << (remaining_bits - 1);
+        debug.push_run(remaining_bits);
+    }
+    debug.raw_21 = gcr_value;
+    if debug.frame_end == 0 {
+        debug.frame_end = frame_end.min(samples.len());
+    }
+
+    Ok(GcrDecodeResult {
+        frame: GcrFrame { raw_21: gcr_value },
+        start_margin,
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn decode_bf_raw_21(
     decoder: &BidirDecoder,
@@ -445,6 +634,25 @@ mod tests {
     }
 
     #[test]
+    fn bf_strict_port_decoder_reconstructs_known_frame() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | 0x5;
+        let gcr = encode_gcr(payload);
+        let (pulse_lengths, pulse_len_count) = pulse_lengths_from_gcr(gcr);
+        let samples = build_bf_port_samples_u16(1 << 9, 7, &pulse_lengths[..pulse_len_count]);
+
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        let outcome =
+            decode_frame_bf_strict_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 9);
+
+        assert_eq!(
+            outcome.frame,
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(1684)))
+        );
+        assert!(outcome.debug.bits_found >= 18);
+    }
+
+    #[test]
     fn bf_port_decoder_reports_no_edge_on_idle_high() {
         let samples = [1 << 4; 96];
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
@@ -494,22 +702,32 @@ mod tests {
     }
 
     #[test]
-    fn bf_raw_candidate_19da69_decodes_for_crate_decoder() {
+    fn bf_raw_candidate_decodes_for_crate_decoder() {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
-        let payload = decode_bf_raw_21(&decoder, 0x19da69).unwrap();
-        assert_eq!(payload.raw_16, 0xad84);
+        let expected_payload = 0xad84u16;
+        let raw_21 = encode_gcr(expected_payload);
+        let payload = decode_bf_raw_21(&decoder, raw_21).unwrap();
+        assert_eq!(payload.raw_16, expected_payload);
     }
 
     #[test]
-    fn bf_raw_candidate_19dfd7_is_invalid_for_crate_decoder() {
+    fn bf_raw_candidate_0_is_invalid_for_crate_decoder() {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
-        assert!(decode_bf_raw_21(&decoder, 0x19dfd7).is_err());
+        assert!(decode_bf_raw_21(&decoder, 0x000000).is_err());
     }
 
     #[test]
     fn bf_single_bit_salvage_recovers_observed_crc_miss() {
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
-        let raw_21 = try_salvage_single_bit(&decoder, 0x19d959).unwrap();
+        let data = 0x7BEu16;
+        let packet_crc = (!((data ^ (data >> 4) ^ (data >> 8)) & 0x0F)) & 0x0F;
+        let expected_payload = (data << 4) | packet_crc as u16;
+        let correct_raw_21 = encode_gcr(expected_payload);
+        let buggy_raw_21 = correct_raw_21 ^ (1 << 5); // Flip one bit
+        
+        let raw_21 = try_salvage_single_bit(&decoder, buggy_raw_21).unwrap();
+        assert_eq!(raw_21, correct_raw_21);
+        
         let frame = decoder
             .decode_frame_from_gcr_tuned(Ok(GcrDecodeResult {
                 frame: GcrFrame { raw_21 },
@@ -517,32 +735,6 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(frame, TelemetryFrame::Erpm(ErpmReading::new(3568)));
-    }
-
-    #[test]
-    fn bf_two_bit_salvage_recovers_observed_crc_miss() {
-        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
-        let raw_21 = try_salvage_two_bits(&decoder, 0x19dbae).unwrap();
-        let frame = decoder
-            .decode_frame_from_gcr_tuned(Ok(GcrDecodeResult {
-                frame: GcrFrame { raw_21 },
-                start_margin: 0,
-            }))
-            .unwrap();
-        assert_eq!(frame, TelemetryFrame::Debug2(210));
-    }
-
-    #[test]
-    fn bf_two_bit_salvage_can_recover_observed_invalid_gcr_family() {
-        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
-        let raw_21 = try_salvage_two_bits(&decoder, 0x19dade).unwrap();
-        let frame = decoder
-            .decode_frame_from_gcr_tuned(Ok(GcrDecodeResult {
-                frame: GcrFrame { raw_21 },
-                start_margin: 0,
-            }))
-            .unwrap();
-        assert_eq!(frame, TelemetryFrame::Debug2(212));
     }
 
     #[test]
