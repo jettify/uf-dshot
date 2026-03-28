@@ -950,7 +950,9 @@ mod tests {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
         // 0x15ea6f is the raw_21 value from the reported error log.
         // It should decode to 0xB83F which is a valid telemetry frame.
-        let payload = decoder.decode_payload(GcrFrame { raw_21: 0x15ea6f }).unwrap();
+        let payload = decoder
+            .decode_payload(GcrFrame { raw_21: 0x15ea6f })
+            .unwrap();
         assert_eq!(payload.raw_16, 0xB83F);
     }
 

@@ -1,4 +1,4 @@
-use crate::telemetry::{
+use uf_dshot::telemetry::{
     BidirDecoder, DecodeHint, GcrDecodeError, GcrDecodeResult, GcrFrame, OversamplingConfig,
     PayloadParseError, SampleDecodeError, TelemetryFrame, TelemetryPayload, TelemetryPipelineError,
 };
@@ -556,7 +556,7 @@ pub(crate) fn decode_bf_raw_21(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::{encode_gcr, ErpmReading};
+    use uf_dshot::telemetry::{encode_gcr, ErpmReading};
 
     fn pulse_lengths_from_gcr(mut gcr: u32) -> ([usize; 21], usize) {
         let mut out = [0usize; 21];

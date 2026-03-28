@@ -17,9 +17,7 @@ use embassy_time::{Duration, Instant, Timer as EmbassyTimer};
 #[cfg(not(feature = "defmt"))]
 use crate::bidir_capture::decode_frame_bf_strict_port_samples_u16;
 #[cfg(feature = "defmt")]
-use crate::bidir_capture::{
-    decode_bf_raw_21, decode_frame_bf_strict_port_samples_with_debug_u16,
-};
+use crate::bidir_capture::{decode_bf_raw_21, decode_frame_bf_strict_port_samples_with_debug_u16};
 use crate::proto::bitbang_bf::{build_port_words, PortFrameError, SignalPolarity, TX_STATE_SLOTS};
 use crate::telemetry::{
     BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
@@ -692,8 +690,10 @@ where
         pin.enter_input_pullup(capture_cfg.pull);
         let pin_idr_ptr = pin.idr_ptr();
 
-        let mut decoder =
-            BidirDecoder::with_preamble_tuning(capture_cfg.oversampling, capture_cfg.preamble_tuning);
+        let mut decoder = BidirDecoder::with_preamble_tuning(
+            capture_cfg.oversampling,
+            capture_cfg.preamble_tuning,
+        );
         decoder.set_stream_hint(capture_cfg.decode_hint);
 
         Ok(Self {
@@ -795,8 +795,7 @@ where
                 self.pin.pin_mask() as u16,
             );
 
-            if outcome.salvaged
-                && (self.capture_attempts <= 8 || self.capture_attempts % 256 == 0)
+            if outcome.salvaged && (self.capture_attempts <= 8 || self.capture_attempts % 256 == 0)
             {
                 defmt::info!(
                     "proto bdshot salvage attempts={} bf_start={} bf_end={} bf_bits={} bf_raw=0x{:06x}",
@@ -936,7 +935,8 @@ where
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
         self.timer.set_cc_dma_enable_state(self.channel, false);
         self.timer.reset();
-        self.irq_phase.store(IrqPhase::TxActive as u8, Ordering::Release);
+        self.irq_phase
+            .store(IrqPhase::TxActive as u8, Ordering::Release);
         self.pin.enter_output_high();
         #[cfg(feature = "defmt")]
         {
@@ -1001,7 +1001,8 @@ where
         self.timer.stop();
         self.timer.set_cc_dma_enable_state(self.channel, false);
         self.pin.enter_input_pullup(self.capture_cfg.pull);
-        self.irq_phase.store(IrqPhase::Idle as u8, Ordering::Release);
+        self.irq_phase
+            .store(IrqPhase::Idle as u8, Ordering::Release);
     }
 
     unsafe fn dma_irq(ctx: *mut ()) {
@@ -1015,7 +1016,8 @@ where
                 .write(|w| w.set_teif(bit, true));
             this.timer.stop();
             this.timer.set_cc_dma_enable_state(this.channel, false);
-            this.irq_phase.store(IrqPhase::Error as u8, Ordering::Release);
+            this.irq_phase
+                .store(IrqPhase::Error as u8, Ordering::Release);
             return;
         }
 
@@ -1045,7 +1047,8 @@ where
                     this.rx_dma_cfg,
                     this.raw_samples.as_mut_ptr(),
                 );
-                this.irq_phase.store(IrqPhase::RxActive as u8, Ordering::Release);
+                this.irq_phase
+                    .store(IrqPhase::RxActive as u8, Ordering::Release);
                 this.timer.set_cc_dma_enable_state(this.channel, true);
                 #[cfg(feature = "defmt")]
                 {
@@ -1064,7 +1067,8 @@ where
                         .as_micros() as u32;
                     this.last_rx_capture_us = now_us.saturating_sub(this.last_rx_armed_irq_us);
                 }
-                this.irq_phase.store(IrqPhase::Done as u8, Ordering::Release);
+                this.irq_phase
+                    .store(IrqPhase::Done as u8, Ordering::Release);
             }
             _ => {}
         }
@@ -1156,11 +1160,9 @@ fn compute_rx_timer_config<T: GeneralInstance4Channel>(
     // inputFreq = outputFreq * 5 * 2 * oversample / 24
     // For the BF default oversample=3, this becomes outputFreq * 5 / 4.
     let symbol_rate_hz = speed.timing_hints().nominal_bitrate_hz;
-    let mut rx_sample_hz =
-        symbol_rate_hz * 5 * capture_cfg.oversampling.oversampling as u32 / 4;
-    rx_sample_hz = rx_sample_hz
-        .saturating_mul(runtime_cfg.rx_sample_percent.clamp(1, 200) as u32)
-        / 100;
+    let mut rx_sample_hz = symbol_rate_hz * 5 * capture_cfg.oversampling.oversampling as u32 / 4;
+    rx_sample_hz =
+        rx_sample_hz.saturating_mul(runtime_cfg.rx_sample_percent.clamp(1, 200) as u32) / 100;
     compute_pacer_timer_config(timer, rx_sample_hz, runtime_cfg.rx_compare_percent)
 }
 
