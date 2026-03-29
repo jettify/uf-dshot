@@ -1,6 +1,0 @@
-build:
-  cargo build --release
-
-flash:
-  cargo build --release
-  probe-rs run --chip STM32F411CEUx target/thumbv7em-none-eabihf/release/dshot-simplepwm-stm32  --connect-under-reset
