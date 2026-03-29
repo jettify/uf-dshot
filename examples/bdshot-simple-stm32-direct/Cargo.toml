@@ -27,7 +27,7 @@ embassy-stm32 = { version = "0.6.0", features = [
 embassy-time = { version = "0.5.0", features = ["tick-hz-1_000_000"] }
 panic-halt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
-uf-dshot = { path = "../../", features = ["defmt"] }
+uf-dshot = { path = "../../", features = ["defmt", "embassy-stm32"] }
 
 [[bin]]
 name = "bdshot-simple-stm32-direct"

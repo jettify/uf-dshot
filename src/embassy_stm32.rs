@@ -6,12 +6,16 @@ pub mod bf_port;
 pub mod bidir_capture;
 
 use core::marker::PhantomData;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 
 use embassy_stm32_hal::dma::{
-    Channel as DmaChannel, InterruptHandler as DmaInterruptHandler, TransferOptions,
+    Channel as DmaChannel, ChannelInstance as DmaChannelInstance,
+    InterruptHandler as EmbassyDmaInterruptHandler, Request, TransferOptions,
 };
 use embassy_stm32_hal::gpio::{AfType, AnyPin, Flex, OutputType, Pull, Speed};
-use embassy_stm32_hal::interrupt::typelevel::Binding;
+use embassy_stm32_hal::interrupt::typelevel::{Binding, Handler};
+use embassy_stm32_hal::pac;
 use embassy_stm32_hal::time::Hertz;
 use embassy_stm32_hal::timer::low_level::{OutputCompareMode, OutputPolarity, RoundTo, Timer};
 use embassy_stm32_hal::timer::{
@@ -20,15 +24,22 @@ use embassy_stm32_hal::timer::{
 use embassy_stm32_hal::Peri;
 use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
+#[cfg(not(feature = "defmt"))]
+use crate::bidir_capture::decode_frame_bf_port_samples_u16;
+#[cfg(feature = "defmt")]
+use crate::bidir_capture::{decode_bf_raw_21, decode_frame_bf_port_samples_with_debug_u16};
 use crate::command::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx, WaveformTiming};
 use crate::telemetry::{
     BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
-    TelemetryPipelineError,
+    TelemetryPipelineError, GcrFrame,
 };
 
 const TX_BUFFER_SLOTS: usize = 17;
+const DIRECT_TX_HOLD_SLOTS: usize = 1;
+const DIRECT_TX_STATE_SLOTS: usize = 16 * 3 + DIRECT_TX_HOLD_SLOTS;
 const MAX_CAPTURE_SAMPLES: usize = 512;
 const PINS_PER_GPIO_PORT: u8 = 16;
+const DMA_IRQ_SLOTS: usize = 16;
 // The ESC turnaround before bidirectional telemetry can exceed 40 us on AM32 setups.
 // Keep enough leading idle-high samples so the default capture window still contains
 // the full 21-bit telemetry frame at DShot300 with 3x oversampling.
@@ -100,7 +111,8 @@ pub struct DshotTxPin<'d, T: GeneralInstance4Channel> {
     line: Flex<'d>,
     af_num: u8,
     pin_mask: u32,
-    idr_ptr: *const u32,
+    bsrr_ptr: *mut u32,
+    idr_ptr: *mut u16,
     channel: Channel,
     _timer: PhantomData<T>,
 }
@@ -126,15 +138,15 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
         let af_num = pin.af_num();
         let pin_mask = 1u32 << pin.pin();
         let pin_port = (pin.port() as usize) * (PINS_PER_GPIO_PORT as usize) + (pin.pin() as usize);
-        let idr_ptr = unsafe { AnyPin::steal(pin_port as u8) }
-            .block()
-            .idr()
-            .as_ptr() as *const u32;
+        let regs = unsafe { AnyPin::steal(pin_port as u8) }.block();
+        let bsrr_ptr = regs.bsrr().as_ptr() as *mut u32;
+        let idr_ptr = regs.idr().as_ptr() as *mut u16;
 
         Self {
             line: Flex::new(pin),
             af_num,
             pin_mask,
+            bsrr_ptr,
             idr_ptr,
             channel,
             _timer: PhantomData,
@@ -172,8 +184,25 @@ impl<'d, T: GeneralInstance4Channel> DshotTxPin<'d, T> {
         self.line.set_as_output(Speed::VeryHigh);
     }
 
+    fn enter_output_high(&mut self) {
+        self.line.set_high();
+        self.line.set_as_output(Speed::VeryHigh);
+    }
+
+    fn bsrr_ptr(&self) -> *mut u32 {
+        self.bsrr_ptr
+    }
+
     fn idr_ptr(&self) -> *const u32 {
+        self.idr_ptr as *const u32
+    }
+
+    fn idr_ptr_u16(&self) -> *mut u16 {
         self.idr_ptr
+    }
+
+    fn pin_mask(&self) -> u32 {
+        self.pin_mask
     }
 
     fn normalize_sample(&self, sample: u32) -> u16 {
@@ -523,7 +552,7 @@ impl RxBackend {
                 {
                     self.timeout_count = self.timeout_count.wrapping_add(1);
                     if self.timeout_count <= 4 || self.timeout_count % 1000 == 0 {
-                        let summary = summarize_samples(slice);
+                        let summary = summarize_samples(slice, tx_pin.pin_mask);
                         defmt::warn!(
                             "bdshot rx timeout attempts={} timeouts={} sample_hz={} count={} highs={} lows={} edges={} first_edge={:?} last_edge={:?} head=0x{:08x},0x{:08x},0x{:08x},0x{:08x}",
                             self.capture_attempts,
@@ -647,8 +676,8 @@ where
 }
 
 #[cfg(feature = "defmt")]
-fn summarize_samples(samples: &[u32]) -> SampleSummary {
-    summarize_levels(samples.iter().copied().map(|v| v != 0))
+fn summarize_samples(samples: &[u32], mask: u32) -> SampleSummary {
+    summarize_levels(samples.iter().copied().map(|v| (v & mask) != 0))
 }
 
 #[cfg(feature = "defmt")]
@@ -976,7 +1005,6 @@ where
         // resulting pending update state before arming DMA so RX capture starts from
         // timer-paced requests instead of immediately consuming buffered software UGs.
         let _ = timer.clear_update_interrupt();
-        timer.enable_update_dma(true);
 
         Self { timer }
     }
@@ -1014,7 +1042,36 @@ where
     #[cfg(feature = "defmt")]
     let cnt_before_start = timer.regs_gp16().cnt().read().cnt();
     #[cfg(feature = "defmt")]
-    let update_dma_before_start = timer.get_update_dma_state();
+    let psc = u32::from(timer.regs_gp16().psc().read());
+    #[cfg(feature = "defmt")]
+    let arr = u32::from(timer.regs_gp16().arr().read().arr());
+    #[cfg(feature = "defmt")]
+    let timer_hz = timer.get_clock_frequency().0;
+
+    #[cfg(feature = "defmt")]
+    {
+        let dier = timer.regs_gp16().dier().read().0;
+        let smcr = timer.regs_gp16().smcr().read().0;
+        let cr1 = timer.regs_gp16().cr1().read().0;
+        let cr2 = timer.regs_gp16().cr2().read().0;
+        let sr = timer.regs_gp16().sr().read().0;
+
+        defmt::debug!(
+            "bdshot rx pre req={} sample_hz={} count={} cnt={} psc={} arr={} timer_hz={} dier=0x{:04x} smcr=0x{:04x} cr1=0x{:04x} cr2=0x{:04x} sr=0x{:04x}",
+            dma_request,
+            sample_hz,
+            buffer.len(),
+            cnt_before_start,
+            psc,
+            arr,
+            timer_hz,
+            dier,
+            smcr,
+            cr1,
+            cr2,
+            sr,
+        );
+    }
 
     let mut transfer = unsafe {
         // SAFETY: DMA reads from the GPIO IDR register for the lifetime of `tx_pin`, writes into
@@ -1031,28 +1088,75 @@ where
 
     #[cfg(feature = "defmt")]
     {
+        let running = transfer.is_running();
+        let remaining = transfer.get_remaining_transfers();
+        let cnt = timer.regs_gp16().cnt().read().cnt();
+        let dier = timer.regs_gp16().dier().read().0;
+        let cr1 = timer.regs_gp16().cr1().read().0;
+        let sr = timer.regs_gp16().sr().read().0;
         defmt::debug!(
-            "bdshot rx arm req={} sample_hz={} count={} timeout_us={} ude={} cnt={}",
+            "bdshot rx armed req={} running={} remaining={} cnt={} dier=0x{:04x} cr1=0x{:04x} sr=0x{:04x}",
+            dma_request,
+            running,
+            remaining,
+            cnt,
+            dier,
+            cr1,
+            sr,
+        );
+    }
+
+    let _ = timer.clear_update_interrupt();
+    timer_guard.start();
+    timer.enable_update_dma(true);
+    let _ = timer.clear_update_interrupt();
+
+    #[cfg(feature = "defmt")]
+    {
+        let ude_after_enable = timer.get_update_dma_state();
+        let dier = timer.regs_gp16().dier().read().0;
+        let smcr = timer.regs_gp16().smcr().read().0;
+        let cr1 = timer.regs_gp16().cr1().read().0;
+        let cr2 = timer.regs_gp16().cr2().read().0;
+        let sr = timer.regs_gp16().sr().read().0;
+
+        defmt::debug!(
+            "bdshot rx arm req={} sample_hz={} count={} timeout_us={} ude={} dier=0x{:04x} cnt={} psc={} arr={} timer_hz={} smcr=0x{:04x} cr1=0x{:04x} cr2=0x{:04x} sr=0x{:04x}",
             dma_request,
             sample_hz,
             buffer.len(),
             timeout.as_micros() as u64,
-            update_dma_before_start,
+            ude_after_enable,
+            dier,
             cnt_before_start,
+            psc,
+            arr,
+            timer_hz,
+            smcr,
+            cr1,
+            cr2,
+            sr,
         );
     }
-
-    timer_guard.start();
 
     #[cfg(feature = "defmt")]
     {
         let cnt_after_start = timer.regs_gp16().cnt().read().cnt();
+        let remaining = transfer.get_remaining_transfers();
+        let head0 = buffer.get(0).copied().unwrap_or(0);
+        let head1 = buffer.get(1).copied().unwrap_or(0);
+        let head2 = buffer.get(2).copied().unwrap_or(0);
+        let head3 = buffer.get(3).copied().unwrap_or(0);
         defmt::debug!(
-            "bdshot rx start req={} ude={} cnt={} remaining={}",
+            "bdshot rx start req={} ude={} cnt={} remaining={} head=0x{:08x},0x{:08x},0x{:08x},0x{:08x}",
             dma_request,
             timer.get_update_dma_state(),
             cnt_after_start,
-            transfer.get_remaining_transfers(),
+            remaining,
+            head0,
+            head1,
+            head2,
+            head3,
         );
 
         EmbassyTimer::after(Duration::from_micros(RX_PROGRESS_PROBE_DELAY_US)).await;
@@ -1107,13 +1211,16 @@ where
                     .filter(|&&sample| sample != buffer[0])
                     .count();
                 defmt::warn!(
-                    "bdshot rx timeout req={} running={} remaining={} changed={} first=0x{:08x} last=0x{:08x}",
+                    "bdshot rx timeout req={} running={} remaining={} changed={} first=0x{:08x} last=0x{:08x} psc={} arr={} timer_hz={}",
                     dma_request,
                     running,
                     remaining,
                     changed_samples,
                     buffer.first().copied().unwrap_or(0),
                     buffer.last().copied().unwrap_or(0),
+                    psc,
+                    arr,
+                    timer_hz,
                 );
             }
             Err(Stm32RuntimeError::RxTimeout)

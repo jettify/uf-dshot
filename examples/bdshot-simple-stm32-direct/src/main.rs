@@ -3,25 +3,23 @@
 
 #[macro_use]
 mod fmt;
-#[path = "embassy_stm32.rs"]
-mod embassy_stm32_local;
 
 use cortex_m::asm;
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
 use embassy_stm32::gpio::Pull;
 use embassy_time::{Duration, Ticker};
 
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use crate::embassy_stm32_local::bidir_capture::{DshotPortPin, Stm32BidirPortController};
-use crate::embassy_stm32_local::Stm32BidirCapture;
+use uf_dshot::embassy_stm32::{DshotTxPin, Stm32BidirCapture, Stm32BidirController};
 use uf_dshot::{DshotSpeed, OversamplingConfig};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
 const ESC_SPEED: DshotSpeed = DshotSpeed::Dshot300;
 const DEMO_THROTTLE: u16 = 200;
-const TELEMETRY_LOG_EVERY_FRAMES: u32 = 128;
+const TELEMETRY_LOG_EVERY_FRAMES: u32 = 256;
 const PACER_COMPARE_PERCENT: u8 = 90;
 const RX_OVERSAMPLING: OversamplingConfig = OversamplingConfig {
     sample_bit_index: 0,
@@ -50,25 +48,20 @@ embassy_stm32::bind_interrupts!(struct ExecutorIrqs {
 });
 
 embassy_stm32::bind_interrupts!(struct DmaIrqs {
-    DMA2_STREAM1 => crate::embassy_stm32_local::bidir_capture::InterruptHandler<embassy_stm32::peripherals::DMA2_CH1>;
+    DMA2_STREAM5 => DmaInterruptHandler<embassy_stm32::peripherals::DMA2_CH5>;
 });
 
 #[embassy_executor::task]
 async fn app() {
     let p = embassy_stm32::init(Default::default());
 
-    let motor_pin = DshotPortPin::new(p.PA8);
+    let motor_pin = DshotTxPin::new_ch1(p.PA8);
     let rx_cfg = Stm32BidirCapture::new(RX_OVERSAMPLING)
         .with_sample_count(RX_SAMPLE_COUNT)
         .with_pull(Pull::None)
         .with_pacer_compare_percent(PACER_COMPARE_PERCENT);
-    let mut esc = unwrap!(Stm32BidirPortController::new_ch1(
-        p.TIM1,
-        p.DMA2_CH1,
-        DmaIrqs,
-        [motor_pin],
-        rx_cfg,
-        ESC_SPEED,
+    let mut esc = unwrap!(Stm32BidirController::bidirectional(
+        p.TIM1, motor_pin, p.DMA2_CH5, DmaIrqs, rx_cfg, ESC_SPEED,
     ));
 
     let frame_period =
@@ -83,15 +76,12 @@ async fn app() {
     loop {
         frames_sent = frames_sent.wrapping_add(1);
 
-        match esc.send_throttles_and_receive([DEMO_THROTTLE]).await {
-            Ok([Ok(frame)]) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
+        match esc.send_throttle_and_receive(DEMO_THROTTLE).await {
+            Ok(frame) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
                 info!("telemetry {:?}", frame);
             }
-            Ok([Err(err)]) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
-                info!("telemetry decode err {:?}", err);
-            }
             Err(err) if frames_sent % TELEMETRY_LOG_EVERY_FRAMES == 0 => {
-                info!("telemetry io err {:?}", err);
+                info!("telemetry err {:?}", err);
             }
             _ => {}
         }
