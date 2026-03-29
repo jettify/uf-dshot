@@ -30,8 +30,8 @@ use crate::bidir_capture::decode_frame_bf_port_samples_u16;
 use crate::bidir_capture::{decode_bf_raw_21, decode_frame_bf_port_samples_with_debug_u16};
 use crate::command::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx, WaveformTiming};
 use crate::telemetry::{
-    BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
-    TelemetryPipelineError, GcrFrame,
+    BidirDecoder, DecodeHint, GcrFrame, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
+    TelemetryPipelineError,
 };
 
 const TX_BUFFER_SLOTS: usize = 17;
@@ -46,6 +46,8 @@ const DMA_IRQ_SLOTS: usize = 16;
 const PREAMBLE_MARGIN_SAMPLES: usize = 64;
 #[cfg(feature = "defmt")]
 const RX_PROGRESS_PROBE_DELAY_US: u64 = 10;
+#[cfg(feature = "defmt")]
+const RX_DEBUG_LOG_EVERY_ATTEMPTS: u32 = 2048;
 const DEFAULT_ARM_DURATION: Duration = Duration::from_millis(3_000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +301,7 @@ where
         timer: Peri<'d, T>,
         tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
-        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
+        tx_dma_irq: impl Binding<D::Interrupt, EmbassyDmaInterruptHandler<D>> + 'd,
         speed: DshotSpeed,
         output_polarity: OutputPolarity,
         idle_mode: TxIdleMode,
@@ -392,14 +394,7 @@ where
         };
 
         match tx_result {
-            Ok(()) => {
-                // DMA completion means the trailing CCR=0 reset slot has been loaded into the
-                // timer, not that the final low interval has finished on the wire yet. Wait one
-                // bit period before cleanup so the line does not glitch between frames.
-                //EmbassyTimer::after(bit_period_duration(self.speed)).await;
-
-                Ok(frame)
-            }
+            Ok(()) => Ok(frame),
             Err(_) => Err(Stm32RuntimeError::TxTimeout),
         }
     }
@@ -479,8 +474,7 @@ struct RxBackend {
     timeout_count: u32,
     #[cfg(feature = "defmt")]
     decode_error_count: u32,
-    raw_samples: [u32; MAX_CAPTURE_SAMPLES],
-    sample_words: [u16; MAX_CAPTURE_SAMPLES],
+    raw_samples: [u16; MAX_CAPTURE_SAMPLES],
 }
 
 impl RxBackend {
@@ -510,7 +504,6 @@ impl RxBackend {
             #[cfg(feature = "defmt")]
             decode_error_count: 0,
             raw_samples: [0; MAX_CAPTURE_SAMPLES],
-            sample_words: [0; MAX_CAPTURE_SAMPLES],
         })
     }
 
@@ -529,10 +522,13 @@ impl RxBackend {
         {
             self.capture_attempts = self.capture_attempts.wrapping_add(1);
         }
+        #[cfg(feature = "defmt")]
+        let log_debug =
+            self.capture_attempts <= 4 || self.capture_attempts % RX_DEBUG_LOG_EVERY_ATTEMPTS == 0;
 
         tx_pin.enter_rx_pullup(self.pull);
         let sample_hz =
-            speed.timing_hints().nominal_bitrate_hz * self.decoder.cfg.oversampling as u32;
+            speed.timing_hints().nominal_bitrate_hz * 5 * self.decoder.cfg.oversampling as u32 / 4;
         let slice = &mut self.raw_samples[..self.sample_count];
 
         match capture_port_samples(
@@ -543,6 +539,8 @@ impl RxBackend {
             sample_hz,
             slice,
             self.timeouts.rx,
+            #[cfg(feature = "defmt")]
+            log_debug,
         )
         .await
         {
@@ -552,7 +550,7 @@ impl RxBackend {
                 {
                     self.timeout_count = self.timeout_count.wrapping_add(1);
                     if self.timeout_count <= 4 || self.timeout_count % 1000 == 0 {
-                        let summary = summarize_samples(slice, tx_pin.pin_mask);
+                        let summary = summarize_samples(slice, tx_pin.pin_mask() as u16);
                         defmt::warn!(
                             "bdshot rx timeout attempts={} timeouts={} sample_hz={} count={} highs={} lows={} edges={} first_edge={:?} last_edge={:?} head=0x{:08x},0x{:08x},0x{:08x},0x{:08x}",
                             self.capture_attempts,
@@ -564,10 +562,10 @@ impl RxBackend {
                             summary.edge_count,
                             summary.first_edge,
                             summary.last_edge,
-                            slice.first().copied().unwrap_or(0),
-                            slice.get(1).copied().unwrap_or(0),
-                            slice.get(2).copied().unwrap_or(0),
-                            slice.get(3).copied().unwrap_or(0),
+                            slice.first().copied().unwrap_or(0) as u32,
+                            slice.get(1).copied().unwrap_or(0) as u32,
+                            slice.get(2).copied().unwrap_or(0) as u32,
+                            slice.get(3).copied().unwrap_or(0) as u32,
                         );
                     }
                 }
@@ -576,52 +574,72 @@ impl RxBackend {
             Err(err) => return Err(err),
         }
 
-        for (dst, src) in self.sample_words[..self.sample_count]
-            .iter_mut()
-            .zip(slice.iter().copied())
+        #[cfg(feature = "defmt")]
         {
-            *dst = tx_pin.normalize_sample(src);
-        }
-
-        match self
-            .decoder
-            .decode_frame_tuned(&self.sample_words[..self.sample_count])
-        {
-            Ok(frame) => Ok(frame),
-            Err(err) => {
-                #[cfg(feature = "defmt")]
-                {
-                    self.decode_error_count = self.decode_error_count.wrapping_add(1);
-                    if self.decode_error_count <= 4 || self.decode_error_count % 1000 == 0 {
-                        let summary =
-                            summarize_samples_u16(&self.sample_words[..self.sample_count]);
-                        let stats = self.decoder.stats();
-                        defmt::warn!(
-                            "bdshot decode err count={} err={} highs={} lows={} edges={} first_edge={:?} last_edge={:?} hint_skip={} stats ok={} no_edge={} short={} invalid_frame={} invalid_gcr={} invalid_crc={} start_margin={} head={},{},{},{}",
-                            self.decode_error_count,
-                            err,
-                            summary.high_count,
-                            summary.low_count,
-                            summary.edge_count,
-                            summary.first_edge,
-                            summary.last_edge,
-                            self.decoder.stream_hint().preamble_skip,
-                            stats.successful_frames,
-                            stats.no_edge,
-                            stats.frame_too_short,
-                            stats.invalid_frame,
-                            stats.invalid_gcr_symbol,
-                            stats.invalid_crc,
-                            stats.last_start_margin,
-                            self.sample_words.first().copied().unwrap_or(0),
-                            self.sample_words.get(1).copied().unwrap_or(0),
-                            self.sample_words.get(2).copied().unwrap_or(0),
-                            self.sample_words.get(3).copied().unwrap_or(0),
-                        );
-                    }
+            let outcome = decode_frame_bf_port_samples_with_debug_u16(
+                &mut self.decoder,
+                &self.raw_samples[..self.sample_count],
+                tx_pin.pin_mask() as u16,
+            );
+            if let Err(err) = outcome.frame {
+                self.decode_error_count = self.decode_error_count.wrapping_add(1);
+                if self.decode_error_count <= 4 || self.decode_error_count % 1000 == 0 {
+                    let summary = summarize_samples(
+                        &self.raw_samples[..self.sample_count],
+                        tx_pin.pin_mask() as u16,
+                    );
+                    let stats = self.decoder.stats();
+                    let (bf_raw_valid, bf_payload) = if outcome.debug.raw_21 != 0 {
+                        match decode_bf_raw_21(&self.decoder, outcome.debug.raw_21) {
+                            Ok(payload) => (true, payload.raw_16 as u32),
+                            Err(_) => (false, 0),
+                        }
+                    } else {
+                        (false, 0)
+                    };
+                    defmt::warn!(
+                        "bdshot decode err count={} err={} highs={} lows={} edges={} first_edge={:?} last_edge={:?} hint_skip={} stats ok={} no_edge={} short={} invalid_frame={} invalid_gcr={} invalid_crc={} start_margin={} bf_start={} bf_end={} bf_bits={} bf_raw=0x{:06x} bf_raw_valid={} bf_payload=0x{:04x} head={},{},{},{}",
+                        self.decode_error_count,
+                        err,
+                        summary.high_count,
+                        summary.low_count,
+                        summary.edge_count,
+                        summary.first_edge,
+                        summary.last_edge,
+                        self.decoder.stream_hint().preamble_skip,
+                        stats.successful_frames,
+                        stats.no_edge,
+                        stats.frame_too_short,
+                        stats.invalid_frame,
+                        stats.invalid_gcr_symbol,
+                        stats.invalid_crc,
+                        stats.last_start_margin,
+                        outcome.debug.start_margin,
+                        outcome.debug.frame_end,
+                        outcome.debug.bits_found,
+                        outcome.debug.raw_21,
+                        bf_raw_valid,
+                        bf_payload,
+                        self.raw_samples.first().copied().unwrap_or(0),
+                        self.raw_samples.get(1).copied().unwrap_or(0),
+                        self.raw_samples.get(2).copied().unwrap_or(0),
+                        self.raw_samples.get(3).copied().unwrap_or(0),
+                    );
                 }
                 Err(Stm32RuntimeError::Telemetry(err))
+            } else {
+                outcome.frame.map_err(Stm32RuntimeError::Telemetry)
             }
+        }
+
+        #[cfg(not(feature = "defmt"))]
+        {
+            decode_frame_bf_port_samples_u16(
+                &mut self.decoder,
+                &self.raw_samples[..self.sample_count],
+                tx_pin.pin_mask() as u16,
+            )
+            .map_err(Stm32RuntimeError::Telemetry)
         }
     }
 }
@@ -676,13 +694,8 @@ where
 }
 
 #[cfg(feature = "defmt")]
-fn summarize_samples(samples: &[u32], mask: u32) -> SampleSummary {
+fn summarize_samples(samples: &[u16], mask: u16) -> SampleSummary {
     summarize_levels(samples.iter().copied().map(|v| (v & mask) != 0))
-}
-
-#[cfg(feature = "defmt")]
-fn summarize_samples_u16(samples: &[u16]) -> SampleSummary {
-    summarize_levels(samples.iter().copied().map(|v| v != 0))
 }
 
 pub struct Stm32DshotController<'d, T, D>
@@ -711,6 +724,10 @@ where
     tx: TxBackend<'d, T, D>,
     rx: RxBackend,
     speed: DshotSpeed,
+    #[cfg(feature = "defmt")]
+    last_tx_completed_at: Instant,
+    #[cfg(feature = "defmt")]
+    last_tx_to_capture_start_us: u32,
 }
 
 impl<'d, T, D> Stm32DshotController<'d, T, D>
@@ -722,7 +739,7 @@ where
         timer: Peri<'d, T>,
         tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
-        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
+        tx_dma_irq: impl Binding<D::Interrupt, EmbassyDmaInterruptHandler<D>> + 'd,
         speed: DshotSpeed,
     ) -> Self {
         Self {
@@ -790,7 +807,7 @@ where
         timer: Peri<'d, T>,
         tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
-        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
+        tx_dma_irq: impl Binding<D::Interrupt, EmbassyDmaInterruptHandler<D>> + 'd,
         speed: DshotSpeed,
     ) -> Self {
         Self {
@@ -858,7 +875,7 @@ where
         timer: Peri<'d, T>,
         tx_pin: DshotTxPin<'d, T>,
         tx_dma: Peri<'d, D>,
-        tx_dma_irq: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
+        tx_dma_irq: impl Binding<D::Interrupt, EmbassyDmaInterruptHandler<D>> + 'd,
         rx_cfg: Stm32BidirCapture,
         speed: DshotSpeed,
     ) -> Result<Self, Stm32ConfigError> {
@@ -875,7 +892,17 @@ where
             .with_timeouts(rx_cfg.timeouts),
             rx: RxBackend::new(rx_cfg)?,
             speed,
+            #[cfg(feature = "defmt")]
+            last_tx_completed_at: Instant::from_ticks(0),
+            #[cfg(feature = "defmt")]
+            last_tx_to_capture_start_us: 0,
         })
+    }
+
+    pub fn with_timeouts(mut self, timeouts: RuntimeTimeouts) -> Self {
+        self.tx = self.tx.with_timeouts(timeouts);
+        self.rx.timeouts = timeouts;
+        self
     }
 
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), Stm32RuntimeError> {
@@ -912,6 +939,10 @@ where
         command: Command,
     ) -> Result<TelemetryFrame, Stm32RuntimeError> {
         self.send_command(command).await?;
+        #[cfg(feature = "defmt")]
+        {
+            self.last_tx_completed_at = Instant::now();
+        }
         self.capture().await
     }
 
@@ -928,10 +959,28 @@ where
     ) -> Result<TelemetryFrame, Stm32RuntimeError> {
         self.send_frame(BidirTx::throttle_clamped(throttle).encode())
             .await?;
+        #[cfg(feature = "defmt")]
+        {
+            self.last_tx_completed_at = Instant::now();
+        }
         self.capture().await
     }
 
     async fn capture(&mut self) -> Result<TelemetryFrame, Stm32RuntimeError> {
+        #[cfg(feature = "defmt")]
+        let capture_started_at = Instant::now();
+        #[cfg(feature = "defmt")]
+        {
+            self.last_tx_to_capture_start_us = capture_started_at
+                .saturating_duration_since(self.last_tx_completed_at)
+                .as_micros() as u32;
+            if self.rx.capture_attempts < 8 || self.rx.capture_attempts % 256 == 0 {
+                defmt::debug!(
+                    "bdshot direct capture start tx_to_capture_start_us={}",
+                    self.last_tx_to_capture_start_us,
+                );
+            }
+        }
         self.rx
             .capture(
                 &self.tx.timer,
@@ -941,6 +990,23 @@ where
                 self.speed,
             )
             .await
+            .map_err(|err| {
+                #[cfg(feature = "defmt")]
+                {
+                    let capture_call_us = Instant::now()
+                        .saturating_duration_since(capture_started_at)
+                        .as_micros() as u32;
+                    if self.rx.capture_attempts <= 8 || self.rx.capture_attempts % 256 == 0 {
+                        defmt::debug!(
+                            "bdshot direct capture err tx_to_capture_start_us={} capture_call_us={} err={}",
+                            self.last_tx_to_capture_start_us,
+                            capture_call_us,
+                            err,
+                        );
+                    }
+                }
+                err
+            })
     }
 }
 
@@ -1030,8 +1096,9 @@ async fn capture_port_samples<T>(
     dma: &mut DmaChannel<'_>,
     dma_request: embassy_stm32_hal::dma::Request,
     sample_hz: u32,
-    buffer: &mut [u32],
+    buffer: &mut [u16],
     timeout: Duration,
+    #[cfg(feature = "defmt")] log_debug: bool,
 ) -> Result<(), Stm32RuntimeError>
 where
     T: GeneralInstance4Channel,
@@ -1049,7 +1116,7 @@ where
     let timer_hz = timer.get_clock_frequency().0;
 
     #[cfg(feature = "defmt")]
-    {
+    if log_debug {
         let dier = timer.regs_gp16().dier().read().0;
         let smcr = timer.regs_gp16().smcr().read().0;
         let cr1 = timer.regs_gp16().cr1().read().0;
@@ -1080,14 +1147,14 @@ where
         // is a read-only register and this transfer only reads from it.
         dma.read_raw(
             dma_request,
-            tx_pin.idr_ptr() as *mut u32,
-            buffer as *mut [u32],
+            tx_pin.idr_ptr_u16(),
+            buffer as *mut [u16],
             options,
         )
     };
 
     #[cfg(feature = "defmt")]
-    {
+    if log_debug {
         let running = transfer.is_running();
         let remaining = transfer.get_remaining_transfers();
         let cnt = timer.regs_gp16().cnt().read().cnt();
@@ -1112,7 +1179,7 @@ where
     let _ = timer.clear_update_interrupt();
 
     #[cfg(feature = "defmt")]
-    {
+    if log_debug {
         let ude_after_enable = timer.get_update_dma_state();
         let dier = timer.regs_gp16().dier().read().0;
         let smcr = timer.regs_gp16().smcr().read().0;
@@ -1140,7 +1207,7 @@ where
     }
 
     #[cfg(feature = "defmt")]
-    {
+    if log_debug {
         let cnt_after_start = timer.regs_gp16().cnt().read().cnt();
         let remaining = transfer.get_remaining_transfers();
         let head0 = buffer.get(0).copied().unwrap_or(0);
@@ -1153,10 +1220,10 @@ where
             timer.get_update_dma_state(),
             cnt_after_start,
             remaining,
-            head0,
-            head1,
-            head2,
-            head3,
+            head0 as u32,
+            head1 as u32,
+            head2 as u32,
+            head3 as u32,
         );
 
         EmbassyTimer::after(Duration::from_micros(RX_PROGRESS_PROBE_DELAY_US)).await;
@@ -1182,20 +1249,24 @@ where
     match rx_result {
         Ok(()) => {
             #[cfg(feature = "defmt")]
-            {
+            if log_debug {
                 let remaining = transfer.get_remaining_transfers();
                 let changed_samples = buffer
                     .iter()
                     .skip(1)
                     .filter(|&&sample| sample != buffer[0])
                     .count();
+                let summary = summarize_samples(buffer, tx_pin.pin_mask() as u16);
                 defmt::debug!(
-                    "bdshot rx done req={} remaining={} changed={} first=0x{:08x} last=0x{:08x}",
+                    "bdshot rx done req={} remaining={} changed={} bit_highs={} bit_lows={} bit_edges={} first=0x{:08x} last=0x{:08x}",
                     dma_request,
                     remaining,
                     changed_samples,
-                    buffer.first().copied().unwrap_or(0),
-                    buffer.last().copied().unwrap_or(0),
+                    summary.high_count,
+                    summary.low_count,
+                    summary.edge_count,
+                    buffer.first().copied().unwrap_or(0) as u32,
+                    buffer.last().copied().unwrap_or(0) as u32,
                 );
             }
             Ok(())
@@ -1216,8 +1287,8 @@ where
                     running,
                     remaining,
                     changed_samples,
-                    buffer.first().copied().unwrap_or(0),
-                    buffer.last().copied().unwrap_or(0),
+                    buffer.first().copied().unwrap_or(0) as u32,
+                    buffer.last().copied().unwrap_or(0) as u32,
                     psc,
                     arr,
                     timer_hz,
