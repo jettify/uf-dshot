@@ -1,4 +1,5 @@
 use core::array;
+use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -12,7 +13,8 @@ use embassy_stm32_hal::timer::{
     Ch1, Ch2, Ch3, Ch4, Channel, Dma, GeneralInstance4Channel, TimerChannel,
 };
 use embassy_stm32_hal::Peri;
-use embassy_time::{Duration, Instant, Timer as EmbassyTimer};
+use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::{with_timeout, Duration, Instant, Ticker, Timer as EmbassyTimer};
 
 #[cfg(not(feature = "defmt"))]
 use crate::bidir_capture::decode_frame_bf_strict_port_samples_u16;
@@ -90,6 +92,31 @@ enum IrqPhase {
     Error = 4,
 }
 
+struct IrqWakerState {
+    phase: AtomicU8,
+    waker: AtomicWaker,
+}
+
+impl IrqWakerState {
+    const fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(IrqPhase::Idle as u8),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn load_phase(&self) -> IrqPhase {
+        match self.phase.load(Ordering::Acquire) {
+            x if x == IrqPhase::Idle as u8 => IrqPhase::Idle,
+            x if x == IrqPhase::TxActive as u8 => IrqPhase::TxActive,
+            x if x == IrqPhase::RxActive as u8 => IrqPhase::RxActive,
+            x if x == IrqPhase::Done as u8 => IrqPhase::Done,
+            x if x == IrqPhase::Error as u8 => IrqPhase::Error,
+            _ => IrqPhase::Error,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PacerTimerConfig {
     psc: u16,
@@ -127,71 +154,28 @@ impl<D: RawDmaChannel> Handler<D::Interrupt> for InterruptHandler<D> {
     }
 }
 
-impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH1 {
-    const IRQ_SLOT: usize = 9;
-    fn regs() -> pac::dma::Dma {
-        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
-    }
+macro_rules! impl_raw_dma_channel {
+    ($periph:ty, $irq_slot:expr, $stream_num:expr) => {
+        impl RawDmaChannel for $periph {
+            const IRQ_SLOT: usize = $irq_slot;
 
-    fn stream_num() -> usize {
-        1
-    }
+            fn regs() -> pac::dma::Dma {
+                unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+            }
+
+            fn stream_num() -> usize {
+                $stream_num
+            }
+        }
+    };
 }
 
-impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH2 {
-    const IRQ_SLOT: usize = 10;
-    fn regs() -> pac::dma::Dma {
-        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
-    }
-
-    fn stream_num() -> usize {
-        2
-    }
-}
-
-impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH3 {
-    const IRQ_SLOT: usize = 11;
-    fn regs() -> pac::dma::Dma {
-        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
-    }
-
-    fn stream_num() -> usize {
-        3
-    }
-}
-
-impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH4 {
-    const IRQ_SLOT: usize = 12;
-    fn regs() -> pac::dma::Dma {
-        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
-    }
-
-    fn stream_num() -> usize {
-        4
-    }
-}
-
-impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH5 {
-    const IRQ_SLOT: usize = 13;
-    fn regs() -> pac::dma::Dma {
-        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
-    }
-
-    fn stream_num() -> usize {
-        5
-    }
-}
-
-impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH6 {
-    const IRQ_SLOT: usize = 14;
-    fn regs() -> pac::dma::Dma {
-        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
-    }
-
-    fn stream_num() -> usize {
-        6
-    }
-}
+impl_raw_dma_channel!(embassy_stm32_hal::peripherals::DMA2_CH1, 9, 1);
+impl_raw_dma_channel!(embassy_stm32_hal::peripherals::DMA2_CH2, 10, 2);
+impl_raw_dma_channel!(embassy_stm32_hal::peripherals::DMA2_CH3, 11, 3);
+impl_raw_dma_channel!(embassy_stm32_hal::peripherals::DMA2_CH4, 12, 4);
+impl_raw_dma_channel!(embassy_stm32_hal::peripherals::DMA2_CH5, 13, 5);
+impl_raw_dma_channel!(embassy_stm32_hal::peripherals::DMA2_CH6, 14, 6);
 
 pub struct DshotPortPin<'d> {
     line: Flex<'d>,
@@ -458,15 +442,22 @@ where
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), PortRuntimeError> {
         let frame_period =
             Duration::from_micros(self.speed.timing_hints().min_frame_period_us as u64);
-        let deadline = Instant::now() + duration;
         let stop_frames = [UniTx::command(Command::MotorStop).encode(); N];
+        let mut ticker = Ticker::every(frame_period);
 
-        while Instant::now() < deadline {
-            self.send_frames(stop_frames).await?;
-            EmbassyTimer::after(frame_period).await;
+        match with_timeout(duration, async {
+            loop {
+                self.send_frames(stop_frames).await?;
+                ticker.next().await;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), PortRuntimeError>(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(()),
         }
-
-        Ok(())
     }
 
     pub async fn arm(&mut self) -> Result<(), PortRuntimeError> {
@@ -511,22 +502,25 @@ where
         self.timer.set_cc_dma_enable_state(self.channel, true);
         self.timer.start();
 
-        let deadline = Instant::now() + self.cfg.tx_timeout;
-        loop {
-            if dma_transfer_error::<D>() {
-                self.stop_tx_dma();
-                return Err(PortRuntimeError::TxDmaError);
-            }
-            if dma_transfer_complete::<D>() {
-                self.stop_tx_dma();
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                self.stop_tx_dma();
-                return Err(PortRuntimeError::TxTimeout);
-            }
+        let result = with_timeout(self.cfg.tx_timeout, async {
+            loop {
+                if dma_transfer_error::<D>() {
+                    return Err(PortRuntimeError::TxDmaError);
+                }
+                if dma_transfer_complete::<D>() {
+                    return Ok(());
+                }
 
-            EmbassyTimer::after(Duration::from_micros(1)).await;
+                EmbassyTimer::after_micros(1).await;
+            }
+        })
+        .await;
+
+        self.stop_tx_dma();
+
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(PortRuntimeError::TxTimeout),
         }
     }
 
@@ -559,7 +553,7 @@ where
     decoder: BidirDecoder,
     tx_words: [u32; TX_STATE_SLOTS],
     raw_samples: [u16; MAX_CAPTURE_SAMPLES],
-    irq_phase: AtomicU8,
+    irq_state: IrqWakerState,
     #[cfg(feature = "defmt")]
     capture_attempts: u32,
     #[cfg(feature = "defmt")]
@@ -714,7 +708,7 @@ where
             decoder,
             tx_words: [0; TX_STATE_SLOTS],
             raw_samples: [0; MAX_CAPTURE_SAMPLES],
-            irq_phase: AtomicU8::new(IrqPhase::Idle as u8),
+            irq_state: IrqWakerState::new(),
             #[cfg(feature = "defmt")]
             capture_attempts: 0,
             #[cfg(feature = "defmt")]
@@ -736,15 +730,22 @@ where
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), PortRuntimeError> {
         let frame_period =
             Duration::from_micros(self.speed.timing_hints().min_frame_period_us as u64);
-        let deadline = Instant::now() + duration;
         let stop_frame = BidirTx::command(Command::MotorStop).encode();
+        let mut ticker = Ticker::every(frame_period);
 
-        while Instant::now() < deadline {
-            self.send_frame(stop_frame).await?;
-            EmbassyTimer::after(frame_period).await;
+        match with_timeout(duration, async {
+            loop {
+                self.send_frame(stop_frame).await?;
+                ticker.next().await;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), PortRuntimeError>(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(()),
         }
-
-        Ok(())
     }
 
     pub async fn arm(&mut self) -> Result<(), PortRuntimeError> {
@@ -910,24 +911,25 @@ where
         self.timer.set_cc_dma_enable_state(self.channel, true);
         self.timer.start();
 
-        let deadline = Instant::now() + self.runtime_cfg.tx_timeout;
-        loop {
-            if dma_transfer_error::<D>() {
-                self.stop_dma_and_timer();
-                return Err(PortRuntimeError::TxDmaError);
-            }
-            if dma_transfer_complete::<D>() {
-                self.stop_dma_and_timer();
-                self.pin.enter_input_pullup(self.capture_cfg.pull);
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                self.stop_dma_and_timer();
-                self.pin.enter_input_pullup(self.capture_cfg.pull);
-                return Err(PortRuntimeError::TxTimeout);
-            }
+        let result = with_timeout(self.runtime_cfg.tx_timeout, async {
+            loop {
+                if dma_transfer_error::<D>() {
+                    return Err(PortRuntimeError::TxDmaError);
+                }
+                if dma_transfer_complete::<D>() {
+                    return Ok(());
+                }
 
-            EmbassyTimer::after(Duration::from_micros(1)).await;
+                EmbassyTimer::after_micros(1).await;
+            }
+        })
+        .await;
+
+        self.stop_dma_and_timer();
+
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(PortRuntimeError::TxTimeout),
         }
     }
 
@@ -935,7 +937,8 @@ where
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
         self.timer.set_cc_dma_enable_state(self.channel, false);
         self.timer.reset();
-        self.irq_phase
+        self.irq_state
+            .phase
             .store(IrqPhase::TxActive as u8, Ordering::Release);
         self.pin.enter_output_high();
         #[cfg(feature = "defmt")]
@@ -961,37 +964,71 @@ where
 
         let tx_deadline = Instant::now() + self.runtime_cfg.tx_timeout;
         let rx_deadline = tx_deadline + self.runtime_cfg.rx_timeout;
-        loop {
-            match self.irq_phase.load(Ordering::Acquire) {
-                x if x == IrqPhase::Done as u8 => {
-                    #[cfg(feature = "defmt")]
-                    {
-                        self.last_rx_handoff_us = self
-                            .last_rx_armed_irq_us
-                            .saturating_sub(self.last_tx_done_irq_us);
-                    }
-                    self.clear_irq_callback();
-                    return Ok(());
+        let tx_result = with_timeout(
+            tx_deadline.saturating_duration_since(Instant::now()),
+            poll_fn(|cx| {
+                self.irq_state.waker.register(cx.waker());
+                match self.irq_state.load_phase() {
+                    IrqPhase::TxActive => core::task::Poll::Pending,
+                    IrqPhase::RxActive | IrqPhase::Done => core::task::Poll::Ready(Ok(())),
+                    IrqPhase::Error => core::task::Poll::Ready(Err(PortRuntimeError::TxDmaError)),
+                    IrqPhase::Idle => core::task::Poll::Ready(Err(PortRuntimeError::TxTimeout)),
                 }
-                x if x == IrqPhase::Error as u8 => {
-                    self.clear_irq_callback();
-                    self.stop_dma_and_timer();
-                    return Err(PortRuntimeError::TxDmaError);
-                }
-                x if x == IrqPhase::TxActive as u8 && Instant::now() >= tx_deadline => {
-                    self.clear_irq_callback();
-                    self.stop_dma_and_timer();
-                    return Err(PortRuntimeError::TxTimeout);
-                }
-                x if x == IrqPhase::RxActive as u8 && Instant::now() >= rx_deadline => {
-                    self.clear_irq_callback();
-                    self.stop_dma_and_timer();
-                    return Err(PortRuntimeError::RxTimeout);
-                }
-                _ => {}
-            }
+            }),
+        )
+        .await;
 
-            EmbassyTimer::after(Duration::from_micros(1)).await;
+        match tx_result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.clear_irq_callback();
+                self.stop_dma_and_timer();
+                return Err(err);
+            }
+            Err(_) => {
+                self.clear_irq_callback();
+                self.stop_dma_and_timer();
+                return Err(PortRuntimeError::TxTimeout);
+            }
+        }
+
+        let rx_result = with_timeout(
+            rx_deadline.saturating_duration_since(Instant::now()),
+            poll_fn(|cx| {
+                self.irq_state.waker.register(cx.waker());
+                match self.irq_state.load_phase() {
+                    IrqPhase::RxActive => core::task::Poll::Pending,
+                    IrqPhase::Done => core::task::Poll::Ready(Ok(())),
+                    IrqPhase::Error => core::task::Poll::Ready(Err(PortRuntimeError::TxDmaError)),
+                    IrqPhase::Idle | IrqPhase::TxActive => {
+                        core::task::Poll::Ready(Err(PortRuntimeError::RxTimeout))
+                    }
+                }
+            }),
+        )
+        .await;
+
+        match rx_result {
+            Ok(Ok(())) => {
+                #[cfg(feature = "defmt")]
+                {
+                    self.last_rx_handoff_us = self
+                        .last_rx_armed_irq_us
+                        .saturating_sub(self.last_tx_done_irq_us);
+                }
+                self.clear_irq_callback();
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                self.clear_irq_callback();
+                self.stop_dma_and_timer();
+                Err(err)
+            }
+            Err(_) => {
+                self.clear_irq_callback();
+                self.stop_dma_and_timer();
+                Err(PortRuntimeError::RxTimeout)
+            }
         }
     }
 
@@ -1001,7 +1038,8 @@ where
         self.timer.stop();
         self.timer.set_cc_dma_enable_state(self.channel, false);
         self.pin.enter_input_pullup(self.capture_cfg.pull);
-        self.irq_phase
+        self.irq_state
+            .phase
             .store(IrqPhase::Idle as u8, Ordering::Release);
     }
 
@@ -1016,8 +1054,10 @@ where
                 .write(|w| w.set_teif(bit, true));
             this.timer.stop();
             this.timer.set_cc_dma_enable_state(this.channel, false);
-            this.irq_phase
+            this.irq_state
+                .phase
                 .store(IrqPhase::Error as u8, Ordering::Release);
+            this.irq_state.waker.wake();
             return;
         }
 
@@ -1030,7 +1070,7 @@ where
         this.timer.set_cc_dma_enable_state(this.channel, false);
         dma_disable::<D>();
 
-        match this.irq_phase.load(Ordering::Acquire) {
+        match this.irq_state.phase.load(Ordering::Acquire) {
             x if x == IrqPhase::TxActive as u8 => {
                 #[cfg(feature = "defmt")]
                 {
@@ -1047,7 +1087,8 @@ where
                     this.rx_dma_cfg,
                     this.raw_samples.as_mut_ptr(),
                 );
-                this.irq_phase
+                this.irq_state
+                    .phase
                     .store(IrqPhase::RxActive as u8, Ordering::Release);
                 this.timer.set_cc_dma_enable_state(this.channel, true);
                 #[cfg(feature = "defmt")]
@@ -1056,6 +1097,7 @@ where
                         .saturating_duration_since(this.tx_irq_started_at)
                         .as_micros() as u32;
                 }
+                this.irq_state.waker.wake();
             }
             x if x == IrqPhase::RxActive as u8 => {
                 this.timer.stop();
@@ -1067,8 +1109,10 @@ where
                         .as_micros() as u32;
                     this.last_rx_capture_us = now_us.saturating_sub(this.last_rx_armed_irq_us);
                 }
-                this.irq_phase
+                this.irq_state
+                    .phase
                     .store(IrqPhase::Done as u8, Ordering::Release);
+                this.irq_state.waker.wake();
             }
             _ => {}
         }
