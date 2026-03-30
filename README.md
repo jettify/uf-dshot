@@ -8,6 +8,7 @@
 `uf-dshot` rust `no_std` library for controlling ESC using `dshot` and `bidirectional dshot` protocols.
 
 
+
 ## Installation
 
 Add `uf-dshot` to your `Cargo.toml`:
@@ -36,4 +37,4 @@ Library is under active development and testing, API might change at any time.
 
 ## License
 
-This project is licensed under the `Apache 2.0`. See the [LICENSE](https://github.com/jettify/uf-dshot/blob/master/LICENSE) file for details.
+This project is licensed under the `GPL-3.0`. See the [LICENSE](https://github.com/jettify/uf-dshot/blob/master/LICENSE) file for details.
