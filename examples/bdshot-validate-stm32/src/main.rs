@@ -172,6 +172,7 @@ async fn app() {
     info!("arm for {} ms", ARM_TIME.as_millis() as u32);
     unwrap!(esc.arm_for(ARM_TIME).await);
 
+    info!("start loop");
     loop {
         for rx_compare_percent in RX_COMPARE_SWEEP {
             let mut counters = TelemetryCounters::default();

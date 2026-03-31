@@ -1,9 +1,16 @@
 use core::convert::TryInto;
+use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
-use embassy_stm32_hal::dma::{self, Channel as DmaChannel, ChannelInstance as DmaChannelInstance};
+use embassy_stm32_hal::dma::{
+    self, Channel as DmaChannel, ChannelInstance as DmaChannelInstance,
+    ReadableRingBuffer as DmaReadableRingBuffer,
+};
 use embassy_stm32_hal::gpio::{AfType, Flex, OutputType, Pull, Speed};
-use embassy_stm32_hal::interrupt::typelevel::Binding;
+use embassy_stm32_hal::interrupt::typelevel::{Binding, Handler};
+use embassy_stm32_hal::pac;
 use embassy_stm32_hal::time::Hertz;
 use embassy_stm32_hal::timer::low_level::{
     FilterValue, InputCaptureMode, InputTISelection, OutputCompareMode, OutputPolarity, RoundTo,
@@ -13,6 +20,7 @@ use embassy_stm32_hal::timer::{
     Ch1, Ch2, Ch3, Ch4, Channel, Dma, GeneralInstance4Channel, TimerChannel, TimerPin, UpDma,
 };
 use embassy_stm32_hal::Peri;
+use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
 use crate::command::{BidirTx, Command, EncodedFrame, WaveformTiming};
@@ -24,8 +32,130 @@ use crate::{DshotSpeed, GcrDecodeResult, TelemetryFrame};
 
 const TX_BUFFER_SLOTS: usize = 17;
 const DEFAULT_ARM_DURATION: Duration = Duration::from_millis(3_000);
+const TX_DMA_IRQ_SLOTS: usize = 16;
 
 pub const MAX_CAPTURE_EDGES: usize = 32;
+
+type TxDmaIrqFn = unsafe fn(*mut ());
+
+static TX_DMA_IRQ_CTX: [AtomicPtr<()>; TX_DMA_IRQ_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; TX_DMA_IRQ_SLOTS];
+static TX_DMA_IRQ_FN: [AtomicPtr<()>; TX_DMA_IRQ_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; TX_DMA_IRQ_SLOTS];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TxRxPhase {
+    Idle = 0,
+    TxActive = 1,
+    RxActive = 2,
+    Error = 3,
+}
+
+struct TxRxWakerState {
+    phase: AtomicU8,
+    waker: AtomicWaker,
+}
+
+impl TxRxWakerState {
+    const fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(TxRxPhase::Idle as u8),
+            waker: AtomicWaker::new(),
+        }
+    }
+}
+
+pub trait RawDmaChannel: DmaChannelInstance {
+    const IRQ_SLOT: usize;
+    fn regs() -> pac::dma::Dma;
+    fn stream_num() -> usize;
+}
+
+pub struct TxDmaInterruptHandler<D: RawDmaChannel> {
+    _phantom: PhantomData<D>,
+}
+
+impl<D: RawDmaChannel> Handler<D::Interrupt> for TxDmaInterruptHandler<D> {
+    unsafe fn on_interrupt() {
+        embassy_stm32_hal::dma::InterruptHandler::<D>::on_interrupt();
+
+        let ctx = TX_DMA_IRQ_CTX[D::IRQ_SLOT].load(Ordering::Acquire);
+        let func = TX_DMA_IRQ_FN[D::IRQ_SLOT].load(Ordering::Acquire);
+        if ctx.is_null() || func.is_null() {
+            return;
+        }
+
+        let func: TxDmaIrqFn = core::mem::transmute(func);
+        func(ctx);
+    }
+}
+
+impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH1 {
+    const IRQ_SLOT: usize = 9;
+    fn regs() -> pac::dma::Dma {
+        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+    }
+
+    fn stream_num() -> usize {
+        1
+    }
+}
+
+impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH2 {
+    const IRQ_SLOT: usize = 10;
+    fn regs() -> pac::dma::Dma {
+        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+    }
+
+    fn stream_num() -> usize {
+        2
+    }
+}
+
+impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH3 {
+    const IRQ_SLOT: usize = 11;
+    fn regs() -> pac::dma::Dma {
+        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+    }
+
+    fn stream_num() -> usize {
+        3
+    }
+}
+
+impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH4 {
+    const IRQ_SLOT: usize = 12;
+    fn regs() -> pac::dma::Dma {
+        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+    }
+
+    fn stream_num() -> usize {
+        4
+    }
+}
+
+impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH5 {
+    const IRQ_SLOT: usize = 13;
+    fn regs() -> pac::dma::Dma {
+        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+    }
+
+    fn stream_num() -> usize {
+        5
+    }
+}
+
+impl RawDmaChannel for embassy_stm32_hal::peripherals::DMA2_CH6 {
+    const IRQ_SLOT: usize = 14;
+    fn regs() -> pac::dma::Dma {
+        unsafe { pac::dma::Dma::from_ptr(pac::DMA2.as_ptr()) }
+    }
+
+    fn stream_num() -> usize {
+        6
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -41,7 +171,7 @@ impl Default for PwmCaptureRuntimeConfig {
         Self {
             rx_timeout: Duration::from_millis(2),
             capture_filter: BF_CAPTURE_FILTER,
-            capture_edge_count: 16,
+            capture_edge_count: MAX_CAPTURE_EDGES,
             capture_pull: Pull::Up,
         }
     }
@@ -263,6 +393,16 @@ where
         &self.raw_capture[..self.captured_edges]
     }
 
+    unsafe fn register_tx_irq_callback(&mut self) {
+        TX_DMA_IRQ_CTX[TxD::IRQ_SLOT].store(self as *mut _ as *mut (), Ordering::Release);
+        TX_DMA_IRQ_FN[TxD::IRQ_SLOT].store(Self::tx_dma_irq as *mut (), Ordering::Release);
+    }
+
+    fn clear_tx_irq_callback(&mut self) {
+        TX_DMA_IRQ_CTX[TxD::IRQ_SLOT].store(ptr::null_mut(), Ordering::Release);
+        TX_DMA_IRQ_FN[TxD::IRQ_SLOT].store(ptr::null_mut(), Ordering::Release);
+    }
+
     pub async fn capture_edges(&mut self) -> Result<usize, PwmCaptureRuntimeError> {
         self.pin.enter_capture(self.runtime_cfg.capture_pull);
         capture_edges_inner(
@@ -312,7 +452,7 @@ where
 pub struct Stm32PwmCaptureBidirController<'d, T, TxD, RxD, C>
 where
     T: GeneralInstance4Channel,
-    TxD: UpDma<T>,
+    TxD: UpDma<T> + RawDmaChannel,
     RxD: DmaChannelInstance,
     C: TimerChannel,
 {
@@ -330,6 +470,7 @@ where
     raw_capture: [u16; MAX_CAPTURE_EDGES],
     timestamps: [u32; MAX_CAPTURE_EDGES],
     captured_edges: usize,
+    txrx_state: TxRxWakerState,
     _tx_dma: PhantomData<TxD>,
     _rx_dma: PhantomData<RxD>,
     _channel: PhantomData<C>,
@@ -338,7 +479,7 @@ where
 impl<'d, T, TxD, RxD, C> Stm32PwmCaptureBidirController<'d, T, TxD, RxD, C>
 where
     T: GeneralInstance4Channel,
-    TxD: UpDma<T>,
+    TxD: UpDma<T> + RawDmaChannel,
     RxD: DmaChannelInstance + Dma<T, C>,
     C: TimerChannel,
 {
@@ -346,7 +487,7 @@ where
         timer: Peri<'d, T>,
         pin: DshotPwmCapturePin<'d, T>,
         tx_dma: Peri<'d, TxD>,
-        tx_dma_irq: impl Binding<TxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<TxD>> + 'd,
+        tx_dma_irq: impl Binding<TxD::Interrupt, TxDmaInterruptHandler<TxD>> + 'd,
         rx_dma: Peri<'d, RxD>,
         rx_dma_irq: impl Binding<RxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<RxD>> + 'd,
         speed: DshotSpeed,
@@ -381,6 +522,7 @@ where
             raw_capture: [0; MAX_CAPTURE_EDGES],
             timestamps: [0; MAX_CAPTURE_EDGES],
             captured_edges: 0,
+            txrx_state: TxRxWakerState::new(),
             _tx_dma: PhantomData,
             _rx_dma: PhantomData,
             _channel: PhantomData,
@@ -420,6 +562,10 @@ where
 
     pub fn captured_edge_count(&self) -> usize {
         self.captured_edges
+    }
+
+    pub fn raw_capture_values(&self) -> &[u16] {
+        &self.raw_capture[..self.captured_edges]
     }
 
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), PwmCaptureBidirRuntimeError> {
@@ -483,8 +629,7 @@ where
         &mut self,
         frame: EncodedFrame,
     ) -> Result<TelemetryFrame, PwmCaptureBidirRuntimeError> {
-        self.run_tx(frame).await?;
-        self.capture_edges().await?;
+        self.run_tx_then_capture(frame).await?;
         self.decode_frame().map_err(Into::into)
     }
 
@@ -492,8 +637,7 @@ where
         &mut self,
         frame: EncodedFrame,
     ) -> Result<(GcrDecodeResult, PwmCaptureDecodeDebug), PwmCaptureBidirRuntimeError> {
-        self.run_tx(frame).await?;
-        self.capture_edges().await?;
+        self.run_tx_then_capture(frame).await?;
         self.decode_gcr().map_err(Into::into)
     }
 
@@ -569,6 +713,170 @@ where
             Err(_) => Err(PwmCaptureBidirRuntimeError::TxTimeout),
         }
     }
+
+    async fn run_tx_then_capture(
+        &mut self,
+        frame: EncodedFrame,
+    ) -> Result<(), PwmCaptureBidirRuntimeError> {
+        let waveform = frame.to_waveform_ticks(self.waveform_timing, true);
+        for (slot, ticks) in self.duty_buffer[..16]
+            .iter_mut()
+            .zip(waveform.bit_high_ticks.iter().copied())
+        {
+            *slot = ticks.into();
+        }
+        self.duty_buffer[16] = waveform.reset_low_ticks.unwrap_or(0).into();
+
+        let capture_len = self.runtime_cfg.capture.capture_edge_count;
+        self.captured_edges = 0;
+        self.raw_capture[..capture_len].fill(0);
+
+        self.timer.stop();
+        self.timer.reset();
+        self.timer.clear_input_interrupt(self.pin.channel());
+
+        let ccr_ptr = self
+            .timer
+            .regs_gp16()
+            .ccr(self.pin.channel().index())
+            .as_ptr() as *mut u16;
+        let mut ring = unsafe {
+            DmaReadableRingBuffer::new(
+                self.rx_dma.reborrow(),
+                self.rx_dma_request,
+                ccr_ptr,
+                &mut self.raw_capture[..capture_len],
+                dma::TransferOptions::default(),
+            )
+        };
+        ring.clear();
+        ring.start();
+
+        configure_tx_timer(&mut self.timer, self.pin.channel(), self.speed);
+        self.pin.enter_tx();
+
+        let tx_ccr = self
+            .timer
+            .regs_gp16()
+            .ccr(self.pin.channel().index())
+            .as_ptr() as *mut T::Word;
+        let transfer = unsafe {
+            self.tx_dma.write(
+                self.tx_dma_request,
+                &self.duty_buffer,
+                tx_ccr,
+                dma::TransferOptions::default(),
+            )
+        };
+
+        self.txrx_state
+            .phase
+            .store(TxRxPhase::TxActive as u8, Ordering::Release);
+        unsafe {
+            self.register_tx_irq_callback();
+        }
+        start_tx_timer(&mut self.timer);
+
+        let tx_result = with_timeout(
+            self.runtime_cfg.tx_timeout,
+            poll_fn(|cx| {
+                self.txrx_state.waker.register(cx.waker());
+                match self.txrx_state.phase.load(Ordering::Acquire) {
+                    x if x == TxRxPhase::TxActive as u8 => core::task::Poll::Pending,
+                    x if x == TxRxPhase::RxActive as u8 => core::task::Poll::Ready(Ok(())),
+                    _ => core::task::Poll::Ready(Err(PwmCaptureBidirRuntimeError::TxTimeout)),
+                }
+            }),
+        )
+        .await;
+
+        self.clear_tx_irq_callback();
+        drop(transfer);
+
+        match tx_result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.finish_capture_early(&mut ring);
+                return Err(err);
+            }
+            Err(_) => {
+                self.finish_capture_early(&mut ring);
+                return Err(PwmCaptureBidirRuntimeError::TxTimeout);
+            }
+        }
+
+        EmbassyTimer::after(self.runtime_cfg.capture.rx_timeout).await;
+        let read = ring
+            .len()
+            .map_err(|_| PwmCaptureBidirRuntimeError::RxTimeout)?;
+        self.finish_capture_early(&mut ring);
+
+        if read == 0 {
+            return Err(PwmCaptureBidirRuntimeError::RxTimeout);
+        }
+
+        normalize_timestamps(
+            &self.raw_capture,
+            &mut self.timestamps,
+            read,
+            &mut self.captured_edges,
+        );
+        Ok(())
+    }
+
+    fn finish_capture_early(&mut self, ring: &mut DmaReadableRingBuffer<'_, u16>) {
+        ring.request_reset();
+        while ring.is_running() {}
+        self.timer
+            .set_cc_dma_enable_state(self.pin.channel(), false);
+        self.timer.enable_channel(self.pin.channel(), false);
+        self.timer.stop();
+        self.pin
+            .enter_capture(self.runtime_cfg.capture.capture_pull);
+        self.txrx_state
+            .phase
+            .store(TxRxPhase::Idle as u8, Ordering::Release);
+    }
+
+    unsafe fn tx_dma_irq(ctx: *mut ()) {
+        let this = &mut *(ctx as *mut Self);
+        let regs = TxD::regs();
+        let isr = regs.isr(TxD::stream_num() / 4).read();
+        let bit = TxD::stream_num() % 4;
+
+        if isr.teif(bit) {
+            regs.ifcr(TxD::stream_num() / 4)
+                .write(|w| w.set_teif(bit, true));
+            stop_tx_timer(&mut this.timer, this.pin.channel());
+            this.pin
+                .enter_capture(this.runtime_cfg.capture.capture_pull);
+            this.txrx_state
+                .phase
+                .store(TxRxPhase::Error as u8, Ordering::Release);
+            this.txrx_state.waker.wake();
+            return;
+        }
+
+        if !isr.tcif(bit) {
+            return;
+        }
+
+        stop_tx_timer(&mut this.timer, this.pin.channel());
+        configure_capture_handoff_timer(
+            &mut this.timer,
+            this.pin.channel(),
+            this.runtime_cfg.capture,
+        );
+        this.pin
+            .enter_capture(this.runtime_cfg.capture.capture_pull);
+        this.timer.set_cc_dma_enable_state(this.pin.channel(), true);
+        this.timer.enable_channel(this.pin.channel(), true);
+        this.timer.start();
+        this.txrx_state
+            .phase
+            .store(TxRxPhase::RxActive as u8, Ordering::Release);
+        this.txrx_state.waker.wake();
+    }
 }
 
 impl<'d, T, D> Stm32PwmCaptureReceiver<'d, T, D, Ch1>
@@ -638,14 +946,14 @@ where
 impl<'d, T, TxD, RxD> Stm32PwmCaptureBidirController<'d, T, TxD, RxD, Ch1>
 where
     T: GeneralInstance4Channel,
-    TxD: UpDma<T>,
+    TxD: UpDma<T> + RawDmaChannel,
     RxD: DmaChannelInstance + Dma<T, Ch1>,
 {
     pub fn new_ch1(
         timer: Peri<'d, T>,
         pin: Peri<'d, impl TimerPin<T, Ch1>>,
         tx_dma: Peri<'d, TxD>,
-        tx_dma_irq: impl Binding<TxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<TxD>> + 'd,
+        tx_dma_irq: impl Binding<TxD::Interrupt, TxDmaInterruptHandler<TxD>> + 'd,
         rx_dma: Peri<'d, RxD>,
         rx_dma_irq: impl Binding<RxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<RxD>> + 'd,
         speed: DshotSpeed,
@@ -665,14 +973,14 @@ where
 impl<'d, T, TxD, RxD> Stm32PwmCaptureBidirController<'d, T, TxD, RxD, Ch2>
 where
     T: GeneralInstance4Channel,
-    TxD: UpDma<T>,
+    TxD: UpDma<T> + RawDmaChannel,
     RxD: DmaChannelInstance + Dma<T, Ch2>,
 {
     pub fn new_ch2(
         timer: Peri<'d, T>,
         pin: Peri<'d, impl TimerPin<T, Ch2>>,
         tx_dma: Peri<'d, TxD>,
-        tx_dma_irq: impl Binding<TxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<TxD>> + 'd,
+        tx_dma_irq: impl Binding<TxD::Interrupt, TxDmaInterruptHandler<TxD>> + 'd,
         rx_dma: Peri<'d, RxD>,
         rx_dma_irq: impl Binding<RxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<RxD>> + 'd,
         speed: DshotSpeed,
@@ -692,14 +1000,14 @@ where
 impl<'d, T, TxD, RxD> Stm32PwmCaptureBidirController<'d, T, TxD, RxD, Ch3>
 where
     T: GeneralInstance4Channel,
-    TxD: UpDma<T>,
+    TxD: UpDma<T> + RawDmaChannel,
     RxD: DmaChannelInstance + Dma<T, Ch3>,
 {
     pub fn new_ch3(
         timer: Peri<'d, T>,
         pin: Peri<'d, impl TimerPin<T, Ch3>>,
         tx_dma: Peri<'d, TxD>,
-        tx_dma_irq: impl Binding<TxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<TxD>> + 'd,
+        tx_dma_irq: impl Binding<TxD::Interrupt, TxDmaInterruptHandler<TxD>> + 'd,
         rx_dma: Peri<'d, RxD>,
         rx_dma_irq: impl Binding<RxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<RxD>> + 'd,
         speed: DshotSpeed,
@@ -719,14 +1027,14 @@ where
 impl<'d, T, TxD, RxD> Stm32PwmCaptureBidirController<'d, T, TxD, RxD, Ch4>
 where
     T: GeneralInstance4Channel,
-    TxD: UpDma<T>,
+    TxD: UpDma<T> + RawDmaChannel,
     RxD: DmaChannelInstance + Dma<T, Ch4>,
 {
     pub fn new_ch4(
         timer: Peri<'d, T>,
         pin: Peri<'d, impl TimerPin<T, Ch4>>,
         tx_dma: Peri<'d, TxD>,
-        tx_dma_irq: impl Binding<TxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<TxD>> + 'd,
+        tx_dma_irq: impl Binding<TxD::Interrupt, TxDmaInterruptHandler<TxD>> + 'd,
         rx_dma: Peri<'d, RxD>,
         rx_dma_irq: impl Binding<RxD::Interrupt, embassy_stm32_hal::dma::InterruptHandler<RxD>> + 'd,
         speed: DshotSpeed,
@@ -788,6 +1096,7 @@ async fn capture_edges_inner<T: GeneralInstance4Channel>(
 ) -> Result<usize, PwmCaptureRuntimeError> {
     let capture_len = runtime_cfg.capture_edge_count;
     *captured_edges = 0;
+    raw_capture[..capture_len].fill(0);
 
     timer.stop();
     timer.reset();
@@ -796,31 +1105,38 @@ async fn capture_edges_inner<T: GeneralInstance4Channel>(
     timer.set_input_capture_mode(channel, InputCaptureMode::BothEdges);
     timer.set_input_capture_filter(channel, FilterValue::from_bits(runtime_cfg.capture_filter));
     timer.set_input_capture_prescaler(channel, 0);
-    timer.set_cc_dma_enable_state(channel, true);
-    timer.enable_channel(channel, true);
-    timer.start();
 
     let ccr_ptr = timer.regs_gp16().ccr(channel.index()).as_ptr() as *mut u16;
-    let transfer = unsafe {
-        dma.read(
-            dma_request,
-            ccr_ptr,
-            &mut raw_capture[..capture_len],
-            dma::TransferOptions::default(),
-        )
+    let read = {
+        let mut ring = unsafe {
+            DmaReadableRingBuffer::new(
+                dma.reborrow(),
+                dma_request,
+                ccr_ptr,
+                &mut raw_capture[..capture_len],
+                dma::TransferOptions::default(),
+            )
+        };
+        ring.clear();
+        timer.set_cc_dma_enable_state(channel, true);
+        timer.enable_channel(channel, true);
+        ring.start();
+        timer.start();
+
+        EmbassyTimer::after(runtime_cfg.rx_timeout).await;
+
+        let received = ring.len().map_err(|_| PwmCaptureRuntimeError::Timeout)?;
+        timer.set_cc_dma_enable_state(channel, false);
+        timer.enable_channel(channel, false);
+        timer.stop();
+        received
     };
 
-    let result = with_timeout(runtime_cfg.rx_timeout, transfer).await;
-    timer.set_cc_dma_enable_state(channel, false);
-    timer.enable_channel(channel, false);
-    timer.stop();
-
-    match result {
-        Ok(()) => {
-            normalize_timestamps(raw_capture, timestamps, capture_len, captured_edges);
-            Ok(*captured_edges)
-        }
-        Err(_) => Err(PwmCaptureRuntimeError::Timeout),
+    if read == 0 {
+        Err(PwmCaptureRuntimeError::Timeout)
+    } else {
+        normalize_timestamps(raw_capture, timestamps, read, captured_edges);
+        Ok(*captured_edges)
     }
 }
 

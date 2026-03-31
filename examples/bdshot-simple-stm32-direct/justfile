@@ -3,8 +3,8 @@
 alias b := build
 alias f := flash
 build:
-  cargo build --release
+  cargo build --release --target thumbv7em-none-eabihf
 
 flash:
-  cargo build --release
+  cargo build --release --target thumbv7em-none-eabihf
   probe-rs run --chip STM32F411CEUx target/thumbv7em-none-eabihf/release/bdshot-simple-stm32-direct --connect-under-reset

@@ -17,12 +17,10 @@ use embassy_stm32_hal::timer::{
 use embassy_stm32_hal::Peri;
 use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
-#[cfg(feature = "defmt")]
-use crate::bidir_capture::{
-    decode_bf_raw_21, decode_frame_bf_strict_port_samples_with_debug_u16,
-};
 #[cfg(not(feature = "defmt"))]
 use crate::bidir_capture::decode_frame_bf_strict_port_samples_u16;
+#[cfg(feature = "defmt")]
+use crate::bidir_capture::{decode_bf_raw_21, decode_frame_bf_strict_port_samples_with_debug_u16};
 use crate::proto::bitbang_bf::{build_port_words, PortFrameError, SignalPolarity, TX_STATE_SLOTS};
 use crate::telemetry::{
     BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,

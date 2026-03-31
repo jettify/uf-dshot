@@ -266,4 +266,32 @@ mod tests {
         assert_eq!(gcr.frame.raw_21, raw_21);
         assert_eq!(debug.zero_deltas_skipped, 1);
     }
+
+    #[test]
+    fn valid_frames_can_use_minimum_edge_count() {
+        let payload = 0x2222;
+        let raw_21 = encode_gcr(payload);
+        let (timestamps, len) = build_timestamps_from_raw_21(raw_21, 16, 1000);
+
+        assert_eq!(len, 9);
+
+        let (gcr, _) =
+            decode_gcr_from_timestamps(&timestamps[..len], PwmCaptureDecodeConfig::default())
+                .unwrap();
+        assert_eq!(gcr.frame.raw_21, raw_21);
+    }
+
+    #[test]
+    fn valid_frames_can_use_maximum_edge_count() {
+        let payload = 0x1111;
+        let raw_21 = encode_gcr(payload);
+        let (timestamps, len) = build_timestamps_from_raw_21(raw_21, 16, 1000);
+
+        assert_eq!(len, 17);
+
+        let (gcr, _) =
+            decode_gcr_from_timestamps(&timestamps[..len], PwmCaptureDecodeConfig::default())
+                .unwrap();
+        assert_eq!(gcr.frame.raw_21, raw_21);
+    }
 }
