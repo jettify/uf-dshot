@@ -5,7 +5,7 @@ use crate::telemetry::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub(crate) struct BfDecodeDebug {
+pub(crate) struct DecodeDebug {
     pub(crate) start_margin: usize,
     pub(crate) frame_end: usize,
     pub(crate) bits_found: u32,
@@ -14,7 +14,7 @@ pub(crate) struct BfDecodeDebug {
     pub(crate) runs: [u8; 12],
 }
 
-impl BfDecodeDebug {
+impl DecodeDebug {
     pub(crate) const fn new() -> Self {
         Self {
             start_margin: 0,
@@ -43,9 +43,9 @@ impl BfDecodeDebug {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) struct BfDecodeOutcome {
+pub(crate) struct DecodeOutcome {
     pub(crate) frame: Result<TelemetryFrame, TelemetryPipelineError>,
-    pub(crate) debug: BfDecodeDebug,
+    pub(crate) debug: DecodeDebug,
     pub(crate) salvaged: bool,
 }
 
@@ -62,7 +62,7 @@ struct PhaseCandidate {
     rank: CandidateRank,
     quality: u8,
     frame: Result<TelemetryFrame, TelemetryPipelineError>,
-    debug: BfDecodeDebug,
+    debug: DecodeDebug,
     gcr: Option<GcrDecodeResult>,
 }
 
@@ -116,28 +116,28 @@ fn try_salvage_two_bits(decoder: &BidirDecoder, raw_21: u32) -> Option<u32> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn decode_frame_bf_port_samples_u16(
+pub(crate) fn decode_frame_port_samples_u16(
     decoder: &mut BidirDecoder,
     samples: &[u16],
     bit_mask: u16,
 ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-    decode_frame_bf_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
+    decode_frame_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
 }
 
 #[allow(dead_code)]
-pub(crate) fn decode_frame_bf_strict_port_samples_u16(
+pub(crate) fn decode_frame_strict_port_samples_u16(
     decoder: &mut BidirDecoder,
     samples: &[u16],
     bit_mask: u16,
 ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-    decode_frame_bf_strict_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
+    decode_frame_strict_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
 }
 
-pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
+pub(crate) fn decode_frame_port_samples_with_debug_u16(
     decoder: &mut BidirDecoder,
     samples: &[u16],
     bit_mask: u16,
-) -> BfDecodeOutcome {
+) -> DecodeOutcome {
     let mut hint = decoder.stream_hint();
     if hint.preamble_skip >= samples.len() {
         hint.preamble_skip = samples.len().saturating_sub(1);
@@ -148,7 +148,7 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
         rank: CandidateRank::Sample,
         quality: 0,
         frame: Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)),
-        debug: BfDecodeDebug::new(),
+        debug: DecodeDebug::new(),
         gcr: None,
     };
 
@@ -161,8 +161,8 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
             preamble_skip: hint.preamble_skip.saturating_sub(phase),
         };
         let candidate = {
-            let mut debug = BfDecodeDebug::new();
-            let gcr = decode_gcr_bf_port_samples_u16(
+            let mut debug = DecodeDebug::new();
+            let gcr = decode_gcr_port_samples_u16(
                 &samples[phase..],
                 bit_mask,
                 phase_hint,
@@ -228,7 +228,7 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
                     start_margin: gcr.start_margin,
                 };
                 if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(salvaged_gcr)) {
-                    return BfDecodeOutcome {
+                    return DecodeOutcome {
                         frame: Ok(frame),
                         debug: best.debug,
                         salvaged: true,
@@ -242,7 +242,7 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
                         start_margin: gcr.start_margin,
                     };
                     if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(salvaged_gcr)) {
-                        return BfDecodeOutcome {
+                        return DecodeOutcome {
                             frame: Ok(frame),
                             debug: best.debug,
                             salvaged: true,
@@ -252,7 +252,7 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
             }
         }
         if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(gcr)) {
-            return BfDecodeOutcome {
+            return DecodeOutcome {
                 frame: Ok(frame),
                 debug: best.debug,
                 salvaged: best.rank != CandidateRank::Frame,
@@ -260,29 +260,28 @@ pub(crate) fn decode_frame_bf_port_samples_with_debug_u16(
         }
     }
 
-    BfDecodeOutcome {
+    DecodeOutcome {
         frame: best.frame,
         debug: best.debug,
         salvaged: false,
     }
 }
 
-pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
+pub(crate) fn decode_frame_strict_port_samples_with_debug_u16(
     decoder: &mut BidirDecoder,
     samples: &[u16],
     bit_mask: u16,
-) -> BfDecodeOutcome {
+) -> DecodeOutcome {
     let mut hint = decoder.stream_hint();
     if hint.preamble_skip >= samples.len() {
         hint.preamble_skip = samples.len().saturating_sub(1);
     }
 
-    let mut debug = BfDecodeDebug::new();
-    let gcr =
-        decode_gcr_bf_strict_port_samples_u16(samples, bit_mask, hint, decoder.cfg, &mut debug);
+    let mut debug = DecodeDebug::new();
+    let gcr = decode_gcr_strict_port_samples_u16(samples, bit_mask, hint, decoder.cfg, &mut debug);
     if let Some(gcr_ok) = gcr.as_ref().ok().copied() {
         if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(gcr_ok)) {
-            return BfDecodeOutcome {
+            return DecodeOutcome {
                 frame: Ok(frame),
                 debug,
                 salvaged: false,
@@ -294,7 +293,7 @@ pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
         let payload_err = match decoder.decode_payload(gcr_ok.frame) {
             Ok(payload) => match decoder.parse_payload(payload) {
                 Ok(frame) => {
-                    return BfDecodeOutcome {
+                    return DecodeOutcome {
                         frame: Ok(frame),
                         debug,
                         salvaged: false,
@@ -315,7 +314,7 @@ pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
                     start_margin: gcr_ok.start_margin,
                 };
                 if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(salvaged_gcr)) {
-                    return BfDecodeOutcome {
+                    return DecodeOutcome {
                         frame: Ok(frame),
                         debug,
                         salvaged: true,
@@ -329,7 +328,7 @@ pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
                         start_margin: gcr_ok.start_margin,
                     };
                     if let Ok(frame) = decoder.decode_frame_from_gcr_tuned(Ok(salvaged_gcr)) {
-                        return BfDecodeOutcome {
+                        return DecodeOutcome {
                             frame: Ok(frame),
                             debug,
                             salvaged: true,
@@ -339,14 +338,14 @@ pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
             }
         }
 
-        return BfDecodeOutcome {
+        return DecodeOutcome {
             frame: Err(payload_err),
             debug,
             salvaged: false,
         };
     }
 
-    BfDecodeOutcome {
+    DecodeOutcome {
         frame: decoder.decode_frame_from_gcr_tuned(gcr),
         debug,
         salvaged: false,
@@ -354,12 +353,12 @@ pub(crate) fn decode_frame_bf_strict_port_samples_with_debug_u16(
 }
 
 #[allow(dead_code)]
-pub(crate) fn decode_gcr_bf_port_samples_u16(
+pub(crate) fn decode_gcr_port_samples_u16(
     samples: &[u16],
     bit_mask: u16,
     hint: DecodeHint,
     cfg: OversamplingConfig,
-    debug: &mut BfDecodeDebug,
+    debug: &mut DecodeDebug,
 ) -> Result<GcrDecodeResult, SampleDecodeError> {
     if cfg.oversampling == 0 || cfg.frame_bits == 0 || cfg.min_detected_bits > cfg.frame_bits {
         return Err(SampleDecodeError::InvalidConfig);
@@ -450,12 +449,12 @@ pub(crate) fn decode_gcr_bf_port_samples_u16(
     })
 }
 
-pub(crate) fn decode_gcr_bf_strict_port_samples_u16(
+pub(crate) fn decode_gcr_strict_port_samples_u16(
     samples: &[u16],
     bit_mask: u16,
     hint: DecodeHint,
     cfg: OversamplingConfig,
-    debug: &mut BfDecodeDebug,
+    debug: &mut DecodeDebug,
 ) -> Result<GcrDecodeResult, SampleDecodeError> {
     if cfg.oversampling == 0 || cfg.frame_bits == 0 || cfg.min_detected_bits > cfg.frame_bits {
         return Err(SampleDecodeError::InvalidConfig);
@@ -546,7 +545,7 @@ pub(crate) fn decode_gcr_bf_strict_port_samples_u16(
 }
 
 #[allow(dead_code)]
-pub(crate) fn decode_bf_raw_21(
+pub(crate) fn decode_raw_21(
     decoder: &BidirDecoder,
     raw_21: u32,
 ) -> Result<TelemetryPayload, GcrDecodeError> {
@@ -587,7 +586,7 @@ mod tests {
         (out, out_len)
     }
 
-    fn build_bf_port_samples_u16(
+    fn build_port_samples_u16(
         bit_mask: u16,
         preamble_high: usize,
         pulse_bits: &[usize],
@@ -617,15 +616,15 @@ mod tests {
     }
 
     #[test]
-    fn bf_port_decoder_reconstructs_known_frame() {
+    fn port_decoder_reconstructs_known_frame() {
         let data = 0x5A5u16;
         let payload = (data << 4) | 0x5;
         let gcr = encode_gcr(payload);
         let (pulse_lengths, pulse_len_count) = pulse_lengths_from_gcr(gcr);
-        let samples = build_bf_port_samples_u16(1 << 9, 7, &pulse_lengths[..pulse_len_count]);
+        let samples = build_port_samples_u16(1 << 9, 7, &pulse_lengths[..pulse_len_count]);
 
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
-        let outcome = decode_frame_bf_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 9);
+        let outcome = decode_frame_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 9);
 
         assert_eq!(
             outcome.frame,
@@ -635,16 +634,16 @@ mod tests {
     }
 
     #[test]
-    fn bf_strict_port_decoder_reconstructs_known_frame() {
+    fn strict_port_decoder_reconstructs_known_frame() {
         let data = 0x5A5u16;
         let payload = (data << 4) | 0x5;
         let gcr = encode_gcr(payload);
         let (pulse_lengths, pulse_len_count) = pulse_lengths_from_gcr(gcr);
-        let samples = build_bf_port_samples_u16(1 << 9, 7, &pulse_lengths[..pulse_len_count]);
+        let samples = build_port_samples_u16(1 << 9, 7, &pulse_lengths[..pulse_len_count]);
 
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
         let outcome =
-            decode_frame_bf_strict_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 9);
+            decode_frame_strict_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 9);
 
         assert_eq!(
             outcome.frame,
@@ -654,10 +653,10 @@ mod tests {
     }
 
     #[test]
-    fn bf_port_decoder_reports_no_edge_on_idle_high() {
+    fn port_decoder_reports_no_edge_on_idle_high() {
         let samples = [1 << 4; 96];
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
-        let outcome = decode_frame_bf_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 4);
+        let outcome = decode_frame_port_samples_with_debug_u16(&mut decoder, &samples, 1 << 4);
 
         assert_eq!(
             outcome.frame,
@@ -666,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn bf_port_decoder_replays_truncated_capture_as_invalid_frame() {
+    fn port_decoder_replays_truncated_capture_as_invalid_frame() {
         let samples = [
             0xE400, 0xE400, 0xE500, 0xE500, 0xE500, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400,
             0xE500, 0xE500, 0xE500, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE500, 0xE500,
@@ -687,7 +686,7 @@ mod tests {
         ];
 
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
-        let outcome = decode_frame_bf_port_samples_with_debug_u16(&mut decoder, &samples, 0x0100);
+        let outcome = decode_frame_port_samples_with_debug_u16(&mut decoder, &samples, 0x0100);
 
         assert_eq!(
             outcome.frame,
@@ -703,22 +702,22 @@ mod tests {
     }
 
     #[test]
-    fn bf_raw_candidate_decodes_for_crate_decoder() {
+    fn raw_candidate_decodes_for_crate_decoder() {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
         let expected_payload = 0xad84u16;
         let raw_21 = encode_gcr(expected_payload);
-        let payload = decode_bf_raw_21(&decoder, raw_21).unwrap();
+        let payload = decode_raw_21(&decoder, raw_21).unwrap();
         assert_eq!(payload.raw_16, expected_payload);
     }
 
     #[test]
-    fn bf_raw_candidate_0_is_invalid_for_crate_decoder() {
+    fn raw_candidate_0_is_invalid_for_crate_decoder() {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
-        assert!(decode_bf_raw_21(&decoder, 0x000000).is_err());
+        assert!(decode_raw_21(&decoder, 0x000000).is_err());
     }
 
     #[test]
-    fn bf_single_bit_salvage_recovers_observed_crc_miss() {
+    fn single_bit_salvage_recovers_observed_crc_miss() {
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
         let data = 0x7BEu16;
         let packet_crc = (!((data ^ (data >> 4) ^ (data >> 8)) & 0x0F)) & 0x0F;
@@ -739,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn bf_integer_run_quantizer_matches_expected_bins() {
+    fn integer_run_quantizer_matches_expected_bins() {
         let oversampling = 6usize;
         let decode =
             |samples: usize| ((samples.saturating_add(oversampling / 2)) / oversampling).max(1);

@@ -955,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn bf_raw_candidate_15ea6f_decodes_to_valid_erpm() {
+    fn raw_candidate_15ea6f_decodes_to_valid_erpm() {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
         // 0x15ea6f is the raw_21 value from the reported error log.
         // It should decode to 0xB83F which is a valid telemetry frame.
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn oversampling_default_matches_bf_reference_window() {
+    fn oversampling_default_matches_reference_window() {
         let cfg = OversamplingConfig::default();
         assert_eq!(cfg.oversampling, 3);
         assert_eq!(cfg.frame_bits, 21);
@@ -996,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn preamble_tuning_default_matches_bf_reference() {
+    fn preamble_tuning_default_matches_reference() {
         let tuning = PreambleTuningConfig::default();
         assert!(tuning.enabled);
         assert_eq!(tuning.target_start_margin, 5);
@@ -1561,6 +1561,90 @@ mod tests {
     }
 
     #[test]
+    fn decode_frame_tuned_port_samples_respects_nonzero_sample_bit_index() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples = build_signal_samples(
+            0,
+            12,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+        let mut port_samples = [0u32; 128];
+        for (dst, sample) in port_samples.iter_mut().zip(samples.iter().copied()) {
+            *dst = if sample != 0 { 1 << 7 } else { 0 };
+        }
+
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 1,
+        };
+        let cfg = OversamplingConfig {
+            sample_bit_index: 7,
+            ..OversamplingConfig::default()
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(cfg, tuning);
+
+        let frame = decoder.decode_frame_tuned_port_samples(&port_samples[..samples.len()], 1 << 7);
+        assert_eq!(frame, Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_u16_respects_nonzero_sample_bit_index() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples = build_signal_samples(
+            0,
+            12,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+        let mut port_samples = [0u16; 128];
+        for (dst, sample) in port_samples.iter_mut().zip(samples.iter().copied()) {
+            *dst = if sample != 0 { 1 << 7 } else { 0 };
+        }
+
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 1,
+        };
+        let cfg = OversamplingConfig {
+            sample_bit_index: 7,
+            ..OversamplingConfig::default()
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(cfg, tuning);
+
+        let frame =
+            decoder.decode_frame_tuned_port_samples_u16(&port_samples[..samples.len()], 1 << 7);
+        assert_eq!(frame, Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_no_edge_backs_off_hint() {
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 32,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+        decoder.set_stream_hint(DecodeHint { preamble_skip: 3 });
+
+        let samples = [1u32 << 7; 96];
+        let frame = decoder.decode_frame_tuned_port_samples(&samples, 1 << 7);
+        assert_eq!(
+            frame,
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+        );
+        assert_eq!(decoder.stream_hint().preamble_skip, 2);
+    }
+
+    #[test]
     fn decode_frame_tuned_no_edge_backs_off_hint() {
         let tuning = PreambleTuningConfig {
             enabled: true,
@@ -1580,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_payload_bf_table_reference_vectors() {
+    fn decode_payload_table_reference_vectors() {
         let decoder = BidirDecoder::new(OversamplingConfig::default());
 
         // 0x0123 in 4b/5b table chunks (0,1,2,3) => (25,27,18,19).

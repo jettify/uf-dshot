@@ -17,7 +17,7 @@ use embassy_stm32_hal::Peri;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
-use crate::bidir_capture::decode_frame_bf_strict_port_samples_u16;
+use crate::bidir_capture::decode_frame_strict_port_samples_u16;
 use crate::telemetry::{
     BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryFrame, TelemetryPipelineError,
 };
@@ -809,7 +809,7 @@ where
     }
 
     fn decode_captured_frame(&mut self) -> Result<TelemetryFrame, DshotError> {
-        decode_frame_bf_strict_port_samples_u16(
+        decode_frame_strict_port_samples_u16(
             &mut self.decoder,
             &self.raw_samples[..self.rx_dma_cfg.len],
             self.pin.pin_mask() as u16,
