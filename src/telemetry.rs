@@ -321,11 +321,20 @@ impl BidirDecoder {
         bit_mask: u32,
     ) -> Result<TelemetryFrame, TelemetryPipelineError> {
         let len = samples.len().min(self.stream_buf.len());
+        let sample_level_mask = if self.cfg.sample_bit_index < 16 {
+            1u16 << self.cfg.sample_bit_index
+        } else {
+            1
+        };
         for (dst, sample) in self.stream_buf[..len]
             .iter_mut()
             .zip(samples.iter().copied())
         {
-            *dst = if (sample & bit_mask) != 0 { 1 } else { 0 };
+            *dst = if (sample & bit_mask) != 0 {
+                sample_level_mask
+            } else {
+                0
+            };
         }
 
         let mut hint = self.stream_tuning_state.hint;
@@ -333,26 +342,17 @@ impl BidirDecoder {
             hint.preamble_skip = len.saturating_sub(1);
         }
 
-        let decoded = {
-            let normalized = &self.stream_buf[..len];
-            let gcr = self
-                .decode_gcr(normalized, hint)
-                .map_err(TelemetryPipelineError::Samples)?;
-            let payload = self
-                .decode_payload(gcr.frame)
-                .map_err(TelemetryPipelineError::GcrDecode)?;
-            let frame = self
-                .parse_payload(payload)
-                .map_err(TelemetryPipelineError::PayloadParse)?;
-            DecodedTelemetry {
-                gcr,
-                payload,
-                frame,
+        match self.decode(&self.stream_buf[..len], hint) {
+            Ok(decoded) => {
+                self.observe_start_margin(decoded.gcr.start_margin);
+                Ok(decoded.frame)
             }
-        };
-
-        self.observe_start_margin(decoded.gcr.start_margin);
-        Ok(decoded.frame)
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
+                self.observe_no_edge();
+                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub fn decode_frame_tuned_port_samples_u16(
@@ -361,11 +361,20 @@ impl BidirDecoder {
         bit_mask: u16,
     ) -> Result<TelemetryFrame, TelemetryPipelineError> {
         let len = samples.len().min(self.stream_buf.len());
+        let sample_level_mask = if self.cfg.sample_bit_index < 16 {
+            1u16 << self.cfg.sample_bit_index
+        } else {
+            1
+        };
         for (dst, sample) in self.stream_buf[..len]
             .iter_mut()
             .zip(samples.iter().copied())
         {
-            *dst = if (sample & bit_mask) != 0 { 1 } else { 0 };
+            *dst = if (sample & bit_mask) != 0 {
+                sample_level_mask
+            } else {
+                0
+            };
         }
 
         let mut hint = self.stream_tuning_state.hint;

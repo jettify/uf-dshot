@@ -616,6 +616,7 @@ where
             .config
             .oversampling
             .recommended_capture_samples(PREAMBLE_MARGIN_SAMPLES);
+        let sample_count = sample_count.min(MAX_CAPTURE_SAMPLES);
         self.rx_dma_cfg = PreparedRxDmaConfig {
             request: self.dma_request,
             peri_addr: self.pin.idr_ptr(),
@@ -1347,7 +1348,7 @@ pub fn build_port_words<const N: usize>(
     init_base_words(&mut out.words, group_mask, polarity);
 
     for (pin_mask, frame) in pin_masks.into_iter().zip(frames.into_iter()) {
-        if (pin_mask & group_mask) == 0 {
+        if pin_mask == 0 || (pin_mask & !group_mask) != 0 {
             return Err(PortFrameError::PinMaskOutsideGroup {
                 pin_mask,
                 group_mask,
@@ -1427,5 +1428,25 @@ mod tests {
         assert_eq!(out.words[0], 1 << 18);
         assert_eq!(out.words[2], 1 << 2);
         assert_eq!(out.words[48], 1 << 2);
+    }
+
+    #[test]
+    fn pin_mask_must_be_subset_of_group_mask() {
+        let frame = UniTx::command(crate::Command::MotorStop).encode();
+        let err = build_port_words(
+            1 << 3,
+            [(1 << 3) | (1 << 4)],
+            [frame],
+            SignalPolarity::Normal,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            PortFrameError::PinMaskOutsideGroup {
+                pin_mask: (1 << 3) | (1 << 4),
+                group_mask: 1 << 3,
+            }
+        );
     }
 }
