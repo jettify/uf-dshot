@@ -315,6 +315,100 @@ impl BidirDecoder {
         }
     }
 
+    pub fn decode_frame_tuned_port_samples(
+        &mut self,
+        samples: &[u32],
+        bit_mask: u32,
+    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
+        let len = samples.len().min(self.stream_buf.len());
+        for (dst, sample) in self.stream_buf[..len]
+            .iter_mut()
+            .zip(samples.iter().copied())
+        {
+            *dst = if (sample & bit_mask) != 0 { 1 } else { 0 };
+        }
+
+        let mut hint = self.stream_tuning_state.hint;
+        if hint.preamble_skip >= len {
+            hint.preamble_skip = len.saturating_sub(1);
+        }
+
+        let decoded = {
+            let normalized = &self.stream_buf[..len];
+            let gcr = self
+                .decode_gcr(normalized, hint)
+                .map_err(TelemetryPipelineError::Samples)?;
+            let payload = self
+                .decode_payload(gcr.frame)
+                .map_err(TelemetryPipelineError::GcrDecode)?;
+            let frame = self
+                .parse_payload(payload)
+                .map_err(TelemetryPipelineError::PayloadParse)?;
+            DecodedTelemetry {
+                gcr,
+                payload,
+                frame,
+            }
+        };
+
+        self.observe_start_margin(decoded.gcr.start_margin);
+        Ok(decoded.frame)
+    }
+
+    pub fn decode_frame_tuned_port_samples_u16(
+        &mut self,
+        samples: &[u16],
+        bit_mask: u16,
+    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
+        let len = samples.len().min(self.stream_buf.len());
+        for (dst, sample) in self.stream_buf[..len]
+            .iter_mut()
+            .zip(samples.iter().copied())
+        {
+            *dst = if (sample & bit_mask) != 0 { 1 } else { 0 };
+        }
+
+        let mut hint = self.stream_tuning_state.hint;
+        if hint.preamble_skip >= len {
+            hint.preamble_skip = len.saturating_sub(1);
+        }
+
+        match self.decode(&self.stream_buf[..len], hint) {
+            Ok(decoded) => {
+                self.observe_start_margin(decoded.gcr.start_margin);
+                Ok(decoded.frame)
+            }
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
+                self.observe_no_edge();
+                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn decode_frame_from_gcr_tuned(
+        &mut self,
+        gcr: Result<GcrDecodeResult, SampleDecodeError>,
+    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
+        match gcr {
+            Ok(gcr) => {
+                let payload = self
+                    .decode_payload(gcr.frame)
+                    .map_err(TelemetryPipelineError::GcrDecode)?;
+                let frame = self
+                    .parse_payload(payload)
+                    .map_err(TelemetryPipelineError::PayloadParse)?;
+                self.observe_start_margin(gcr.start_margin);
+                Ok(frame)
+            }
+            Err(SampleDecodeError::NoEdge) => {
+                self.observe_no_edge();
+                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+            }
+            Err(err) => Err(TelemetryPipelineError::Samples(err)),
+        }
+    }
+
     pub fn decode_gcr(
         &self,
         samples: &[u16],
@@ -482,10 +576,14 @@ fn calculate_crc(value: u16) -> u8 {
     ((value ^ (value >> 4) ^ (value >> 8)) & 0x0F) as u8
 }
 
+fn calculate_telemetry_crc(value: u16) -> u8 {
+    (!calculate_crc(value)) & 0x0F
+}
+
 pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadParseError> {
     let data = payload >> PAYLOAD_DATA_SHIFT;
     let packet_crc = (payload & PAYLOAD_CRC_MASK) as u8;
-    let calculated_crc = calculate_crc(data);
+    let calculated_crc = calculate_telemetry_crc(data);
 
     if packet_crc != calculated_crc {
         return Err(PayloadParseError::InvalidCrc {
@@ -576,7 +674,7 @@ const GCR_DECODE_TABLE: [u8; 32] = [
 ];
 
 pub fn decode_gcr(gcr_value: u32) -> Option<u16> {
-    let gcr_encoded = (gcr_value ^ (gcr_value >> 1)) & 0xFFFFF;
+    let gcr_encoded = gcr_value & 0xFFFFF;
 
     let mut result: u16 = 0;
     let mut i = 0;
@@ -607,17 +705,7 @@ pub fn encode_gcr(payload: u16) -> u32 {
         i += 1;
     }
 
-    let mut gcr_value: u32 = 1 << 20;
-    let mut last_bit = 1;
-    i = 0;
-    while i < 20 {
-        let gcr_bit = (gcr_encoded >> (19 - i)) & 1;
-        let current_bit = last_bit ^ gcr_bit;
-        gcr_value |= current_bit << (19 - i);
-        last_bit = current_bit;
-        i += 1;
-    }
-    gcr_value
+    gcr_encoded | (1 << 20)
 }
 
 fn decode_gcr_from_samples_cfg(
@@ -824,17 +912,7 @@ mod tests {
     }
 
     fn gcr_raw_from_encoded_20(gcr_encoded: u32) -> u32 {
-        let mut gcr_value: u32 = 1 << 20;
-        let mut last_bit = 1;
-        let mut i = 0;
-        while i < 20 {
-            let gcr_bit = (gcr_encoded >> (19 - i)) & 1;
-            let current_bit = last_bit ^ gcr_bit;
-            gcr_value |= current_bit << (19 - i);
-            last_bit = current_bit;
-            i += 1;
-        }
-        gcr_value
+        gcr_encoded | (1 << 20)
     }
 
     fn pulse_lengths_from_gcr(mut gcr: u32) -> ([usize; 21], usize) {
@@ -865,6 +943,17 @@ mod tests {
         }
 
         (out, out_len)
+    }
+
+    #[test]
+    fn bf_raw_candidate_15ea6f_decodes_to_valid_erpm() {
+        let decoder = BidirDecoder::new(OversamplingConfig::default());
+        // 0x15ea6f is the raw_21 value from the reported error log.
+        // It should decode to 0xB83F which is a valid telemetry frame.
+        let payload = decoder
+            .decode_payload(GcrFrame { raw_21: 0x15ea6f })
+            .unwrap();
+        assert_eq!(payload.raw_16, 0xB83F);
     }
 
     #[test]
@@ -911,7 +1000,7 @@ mod tests {
         assert_eq!(
             parse_telemetry_payload(payload),
             Err(PayloadParseError::InvalidCrc {
-                calculated_crc: 9,
+                calculated_crc: 6,
                 packet_crc: 8,
             })
         );
@@ -919,7 +1008,7 @@ mod tests {
 
     #[test]
     fn payload_parse_erpm() {
-        let payload = 0x8109;
+        let payload = 0x8106;
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Erpm(ErpmReading::new(256)))
@@ -929,7 +1018,7 @@ mod tests {
     #[test]
     fn payload_parse_erpm_range_sentinel_maps_to_zero() {
         let data = 0x0FFFu16;
-        let payload = (data << 4) | calculate_crc(data) as u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Erpm(ErpmReading::new(0)))
@@ -939,7 +1028,7 @@ mod tests {
     #[test]
     fn payload_parse_erpm_zero_period_is_invalid() {
         let data = 0x000u16;
-        let payload = (data << 4) | calculate_crc(data) as u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         assert_eq!(
             parse_telemetry_payload(payload),
             Err(PayloadParseError::InvalidErpmPeriod)
@@ -948,7 +1037,8 @@ mod tests {
 
     #[test]
     fn payload_parse_extended_temperature() {
-        let payload = 0x219A;
+        let data = 0x219u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Temperature(25))
@@ -1101,7 +1191,8 @@ mod tests {
 
     #[test]
     fn end_to_end_decode_known_value() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
 
@@ -1121,7 +1212,8 @@ mod tests {
 
     #[test]
     fn end_to_end_decode_frame_known_value() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
 
@@ -1154,7 +1246,8 @@ mod tests {
 
     #[test]
     fn push_sample_streaming_yields_result() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
 
@@ -1180,7 +1273,8 @@ mod tests {
 
     #[test]
     fn push_sample_frame_streaming_yields_result() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
 
@@ -1206,7 +1300,8 @@ mod tests {
 
     #[test]
     fn push_sample_updates_stats_on_success() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
         let samples = build_signal_samples(
@@ -1237,7 +1332,8 @@ mod tests {
 
     #[test]
     fn push_sample_invalid_crc_is_consumed_before_next_frame() {
-        let valid_payload = 23130u16;
+        let data = 0x5A5u16;
+        let valid_payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let invalid_crc_payload = (valid_payload & !0x000F) | ((valid_payload + 1) & 0x000F);
 
         let invalid_gcr = encode_gcr(invalid_crc_payload);
@@ -1292,7 +1388,8 @@ mod tests {
 
     #[test]
     fn push_sample_frame_too_short_keeps_partial_frame() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
         let samples = build_signal_samples(
@@ -1345,7 +1442,8 @@ mod tests {
 
     #[test]
     fn preamble_tuning_updates_stream_hint_after_window() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
         let samples = build_signal_samples(
@@ -1401,7 +1499,8 @@ mod tests {
 
     #[test]
     fn decode_frame_tuned_updates_hint_after_success() {
-        let payload = 23130u16;
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         let gcr = encode_gcr(payload);
         let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
         let samples = build_signal_samples(
@@ -1420,6 +1519,35 @@ mod tests {
 
         let frame = decoder.decode_frame_tuned(&samples);
         assert!(frame.is_ok());
+        assert_eq!(decoder.stream_hint().preamble_skip, 7);
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_reuses_tuned_decoder() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples = build_signal_samples(
+            0,
+            12,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+        let mut port_samples = [0u32; 128];
+        for (dst, sample) in port_samples.iter_mut().zip(samples.iter().copied()) {
+            *dst = if sample != 0 { 1 << 7 } else { 0 };
+        }
+
+        let tuning = PreambleTuningConfig {
+            enabled: true,
+            target_start_margin: 5,
+            update_interval_frames: 1,
+        };
+        let mut decoder = BidirDecoder::with_preamble_tuning(OversamplingConfig::default(), tuning);
+
+        let frame = decoder.decode_frame_tuned_port_samples(&port_samples[..samples.len()], 1 << 7);
+        assert_eq!(frame, Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
         assert_eq!(decoder.stream_hint().preamble_skip, 7);
     }
 
@@ -1483,7 +1611,7 @@ mod tests {
     fn test_parse_extended_telemetry_types() {
         // Type 0x06 (current) with value 0x55 and valid crc.
         let data = 0x655;
-        let payload = (data << 4) | (calculate_crc(data) as u16);
+        let payload = (data << 4) | (calculate_telemetry_crc(data) as u16);
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Current(0x55))
@@ -1491,7 +1619,7 @@ mod tests {
 
         // Another reachable extended type (0x0A).
         let data = 0xA55;
-        let payload = (data << 4) | (calculate_crc(data) as u16);
+        let payload = (data << 4) | (calculate_telemetry_crc(data) as u16);
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Debug2(0x55))

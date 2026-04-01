@@ -2,7 +2,7 @@
 
 [package]
 edition = "2021"
-name = "bdshot-stm32"
+name = "bdshot-validate-stm32"
 version = "0.1.0"
 
 [dependencies]
@@ -15,12 +15,8 @@ defmt = { version = "1.0.1", optional = true }
 defmt-rtt = { version = "1.1.0", optional = true }
 embassy-executor = { version = "0.10.0", features = [
   "platform-cortex-m",
-  "executor-thread",
+  "executor-interrupt",
 ] }
-embassy-sync = "0.8.0"
-embassy-time = { version = "0.5.0", features = ["tick-hz-1_000_000"] }
-panic-halt = "1.0.0"
-panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 embassy-stm32 = { version = "0.6.0", features = [
   "memory-x",
   "stm32f411ce",
@@ -28,10 +24,13 @@ embassy-stm32 = { version = "0.6.0", features = [
   "exti",
   "unstable-pac",
 ] }
+embassy-time = { version = "0.5.0", features = ["tick-hz-1_000_000"] }
+panic-halt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 uf-dshot = { path = "../../", features = ["defmt", "embassy-stm32"] }
 
 [[bin]]
-name = "bdshot-stm32"
+name = "bdshot-validate-stm32"
 test = false
 bench = false
 
@@ -60,7 +59,6 @@ debug = [
   "defmt-rtt",
   "panic-probe",
   "embassy-executor/defmt",
-  "embassy-sync/defmt",
   "embassy-time/defmt",
   "embassy-time/defmt-timestamp-uptime",
   "embassy-stm32/defmt",
