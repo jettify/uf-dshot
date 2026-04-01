@@ -10,7 +10,7 @@ use embassy_time::{Duration, Ticker};
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use uf_dshot::embassy_stm32::{DshotPortPin, InterruptHandler, Stm32TxPortController};
+use uf_dshot::embassy_stm32::{DshotPortPin, InterruptHandler, Stm32DshotPort};
 use uf_dshot::DshotSpeed;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
@@ -27,7 +27,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     let tx_pin = DshotPortPin::new(p.PA8);
-    let mut esc = unwrap!(Stm32TxPortController::new_ch1(
+    let mut esc = unwrap!(Stm32DshotPort::new_ch1(
         p.TIM1,
         p.DMA2_CH3,
         DmaIrqs,

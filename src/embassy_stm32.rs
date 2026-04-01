@@ -19,8 +19,7 @@ use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
 use crate::bidir_capture::decode_frame_bf_strict_port_samples_u16;
 use crate::telemetry::{
-    BidirDecoder, DecodeHint, OversamplingConfig, PreambleTuningConfig, TelemetryFrame,
-    TelemetryPipelineError,
+    BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryFrame, TelemetryPipelineError,
 };
 use crate::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx};
 
@@ -76,26 +75,68 @@ static DMA_IRQ_SLOTS_TABLE: [IrqSlot; DMA_IRQ_SLOTS] = [const { IrqSlot::new() }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct PortRuntimeConfig {
-    pub tx_timeout: Duration,
-    pub pacer_compare_percent: u8,
+pub enum DshotError {
+    TxTimeout,
+    TxDmaError,
+    RxDmaError,
+    RxTimeout,
+    Frame(PortFrameError),
+    Telemetry(TelemetryPipelineError),
 }
 
-impl Default for PortRuntimeConfig {
-    fn default() -> Self {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DshotConfig {
+    pub speed: DshotSpeed,
+    pub tx_timeout: Duration,
+    pub rx_timeout: Duration,
+    pub pacer_compare_percent: u8,
+    // Bidir specific
+    pub oversampling: OversamplingConfig,
+    pub preamble_tuning: PreambleTuningConfig,
+    pub pull: Pull,
+    pub rx_compare_percent: u8,
+    pub rx_sample_percent: u8,
+}
+
+impl DshotConfig {
+    pub fn new(speed: DshotSpeed) -> Self {
         Self {
+            speed,
             tx_timeout: Duration::from_millis(2),
+            rx_timeout: Duration::from_millis(2),
             pacer_compare_percent: 50,
+            oversampling: OversamplingConfig::default(),
+            preamble_tuning: PreambleTuningConfig::default(),
+            pull: Pull::Up,
+            rx_compare_percent: 50,
+            rx_sample_percent: 100,
         }
     }
-}
 
-impl PortRuntimeConfig {
-    fn normalized(self) -> Self {
-        Self {
-            tx_timeout: self.tx_timeout,
-            pacer_compare_percent: self.pacer_compare_percent.clamp(1, 99),
-        }
+    pub fn with_tx_timeout(mut self, timeout: Duration) -> Self {
+        self.tx_timeout = timeout;
+        self
+    }
+
+    pub fn with_rx_timeout(mut self, timeout: Duration) -> Self {
+        self.rx_timeout = timeout;
+        self
+    }
+
+    pub fn with_pacer_compare_percent(mut self, percent: u8) -> Self {
+        self.pacer_compare_percent = percent.clamp(1, 99);
+        self
+    }
+
+    pub fn with_bidir_pull(mut self, pull: Pull) -> Self {
+        self.pull = pull;
+        self
+    }
+
+    pub fn with_oversampling(mut self, oversampling: OversamplingConfig) -> Self {
+        self.oversampling = oversampling;
+        self
     }
 }
 
@@ -112,16 +153,6 @@ pub enum PortConfigError {
         requested: usize,
         capacity: usize,
     },
-    Frame(PortFrameError),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum PortRuntimeError {
-    TxTimeout,
-    TxDmaError,
-    RxDmaError,
-    RxTimeout,
     Frame(PortFrameError),
 }
 
@@ -153,7 +184,7 @@ impl IrqPhase {
 enum PhaseDisposition {
     Pending,
     Done,
-    Error(PortRuntimeError),
+    Error(DshotError),
 }
 
 struct IrqWakerState {
@@ -185,9 +216,9 @@ impl IrqWakerState {
     async fn wait_for_phase(
         &self,
         timeout: Duration,
-        timeout_err: PortRuntimeError,
+        timeout_err: DshotError,
         classify: impl Fn(IrqPhase) -> PhaseDisposition,
-    ) -> Result<(), PortRuntimeError> {
+    ) -> Result<(), DshotError> {
         with_timeout(
             timeout,
             poll_fn(|cx| {
@@ -203,13 +234,13 @@ impl IrqWakerState {
         .map_err(|_| timeout_err)?
     }
 
-    async fn wait_done(&self, timeout: Duration) -> Result<(), PortRuntimeError> {
-        self.wait_for_phase(timeout, PortRuntimeError::TxTimeout, |phase| match phase {
+    async fn wait_done(&self, timeout: Duration) -> Result<(), DshotError> {
+        self.wait_for_phase(timeout, DshotError::TxTimeout, |phase| match phase {
             IrqPhase::TxActive | IrqPhase::RxActive => PhaseDisposition::Pending,
             IrqPhase::Done => PhaseDisposition::Done,
-            IrqPhase::TxError => PhaseDisposition::Error(PortRuntimeError::TxDmaError),
-            IrqPhase::RxError => PhaseDisposition::Error(PortRuntimeError::RxDmaError),
-            IrqPhase::Idle => PhaseDisposition::Error(PortRuntimeError::TxTimeout),
+            IrqPhase::TxError => PhaseDisposition::Error(DshotError::TxDmaError),
+            IrqPhase::RxError => PhaseDisposition::Error(DshotError::RxDmaError),
+            IrqPhase::Idle => PhaseDisposition::Error(DshotError::TxTimeout),
         })
         .await
     }
@@ -391,94 +422,18 @@ macro_rules! impl_bidir_pin_channel_ctors {
                 dma: Peri<'d, D>,
                 dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
                 pin: DshotPortPin<'d>,
-                capture_cfg: BidirCaptureConfig,
                 speed: DshotSpeed,
             ) -> Result<Self, PortConfigError>
             where
                 D: Dma<T, $channel>,
             {
-                Self::new_inner::<$channel>(timer, dma, dma_irq, pin, capture_cfg, speed)
+                Self::new_inner::<$channel>(timer, dma, dma_irq, pin, speed)
             }
         )+
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct BidirPortRuntimeConfig {
-    pub tx_timeout: Duration,
-    pub rx_timeout: Duration,
-    pub pacer_compare_percent: u8,
-    pub rx_compare_percent: u8,
-    pub rx_sample_percent: u8,
-}
-
-impl Default for BidirPortRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            tx_timeout: Duration::from_millis(2),
-            rx_timeout: Duration::from_millis(2),
-            pacer_compare_percent: 50,
-            rx_compare_percent: 50,
-            rx_sample_percent: 100,
-        }
-    }
-}
-
-impl BidirPortRuntimeConfig {
-    fn normalized(self) -> Self {
-        Self {
-            tx_timeout: self.tx_timeout,
-            rx_timeout: self.rx_timeout,
-            pacer_compare_percent: self.pacer_compare_percent.clamp(1, 99),
-            rx_compare_percent: self.rx_compare_percent.clamp(1, 99),
-            rx_sample_percent: self.rx_sample_percent.clamp(1, 200),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct BidirCaptureConfig {
-    oversampling: OversamplingConfig,
-    sample_count: usize,
-    decode_hint: DecodeHint,
-    pull: Pull,
-    preamble_tuning: PreambleTuningConfig,
-}
-
-impl BidirCaptureConfig {
-    pub fn new(oversampling: OversamplingConfig) -> Self {
-        Self {
-            sample_count: oversampling.recommended_capture_samples(PREAMBLE_MARGIN_SAMPLES),
-            oversampling,
-            decode_hint: DecodeHint::default(),
-            pull: Pull::Up,
-            preamble_tuning: PreambleTuningConfig::default(),
-        }
-    }
-
-    pub fn with_sample_count(mut self, sample_count: usize) -> Self {
-        self.sample_count = sample_count;
-        self
-    }
-
-    pub fn with_decode_hint(mut self, hint: DecodeHint) -> Self {
-        self.decode_hint = hint;
-        self
-    }
-
-    pub fn with_pull(mut self, pull: Pull) -> Self {
-        self.pull = pull;
-        self
-    }
-
-    pub fn with_preamble_tuning(mut self, tuning: PreambleTuningConfig) -> Self {
-        self.preamble_tuning = tuning;
-        self
-    }
-}
-
-pub struct Stm32TxPortController<'d, T, D, const N: usize>
+pub struct Stm32DshotPort<'d, T, D, const N: usize>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -489,15 +444,14 @@ where
     pin_masks: [u32; N],
     group_mask: u32,
     channel: Channel,
-    speed: DshotSpeed,
-    cfg: PortRuntimeConfig,
+    config: DshotConfig,
     tx_timer_cfg: PacerTimerConfig,
     tx_words: [u32; TX_STATE_SLOTS],
     irq_state: IrqWakerState,
     _dma: PhantomData<D>,
 }
 
-impl<'d, T, D, const N: usize> Stm32TxPortController<'d, T, D, N>
+impl<'d, T, D, const N: usize> Stm32DshotPort<'d, T, D, N>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -509,15 +463,14 @@ where
         (new_ch4, Ch4),
     }
 
-    pub fn with_runtime_config(mut self, cfg: PortRuntimeConfig) -> Self {
-        self.cfg = cfg.normalized();
+    pub fn set_config(&mut self, config: DshotConfig) {
+        self.config = config;
         self.tx_timer_cfg = compute_pacer_timer_config(
             &self.timer,
-            self.speed.timing_hints().nominal_bitrate_hz * 3,
-            self.cfg.pacer_compare_percent,
+            self.config.speed.timing_hints().nominal_bitrate_hz * 3,
+            self.config.pacer_compare_percent,
         );
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
-        self
     }
 
     fn new_inner<C>(
@@ -537,11 +490,11 @@ where
         drop(dma);
 
         let timer = Timer::new(timer);
-        let cfg = PortRuntimeConfig::default().normalized();
+        let config = DshotConfig::new(speed);
         let tx_timer_cfg = compute_pacer_timer_config(
             &timer,
             speed.timing_hints().nominal_bitrate_hz * 3,
-            cfg.pacer_compare_percent,
+            config.pacer_compare_percent,
         );
         configure_pacer_timer(&timer, C::CHANNEL, tx_timer_cfg);
 
@@ -556,8 +509,7 @@ where
             pin_masks: pin_set.pin_masks,
             group_mask: pin_set.group_mask,
             channel: C::CHANNEL,
-            speed,
-            cfg,
+            config,
             tx_timer_cfg,
             tx_words: [0; TX_STATE_SLOTS],
             irq_state: IrqWakerState::new(),
@@ -565,9 +517,9 @@ where
         })
     }
 
-    pub async fn arm_for(&mut self, duration: Duration) -> Result<(), PortRuntimeError> {
+    pub async fn arm_for(&mut self, duration: Duration) -> Result<(), DshotError> {
         let frame_period =
-            Duration::from_micros(self.speed.timing_hints().min_frame_period_us as u64);
+            Duration::from_micros(self.config.speed.timing_hints().min_frame_period_us as u64);
         let stop_frames = [UniTx::command(Command::MotorStop).encode(); N];
         let deadline = Instant::now() + duration;
 
@@ -579,29 +531,29 @@ where
         Ok(())
     }
 
-    pub async fn arm(&mut self) -> Result<(), PortRuntimeError> {
+    pub async fn arm(&mut self) -> Result<(), DshotError> {
         self.arm_for(DEFAULT_ARM_DURATION).await
     }
 
-    pub async fn send_throttles(&mut self, throttles: [u16; N]) -> Result<(), PortRuntimeError> {
+    pub async fn send_throttles(&mut self, throttles: [u16; N]) -> Result<(), DshotError> {
         self.send_frames(throttles.map(|throttle| UniTx::throttle_clamped(throttle).encode()))
             .await
     }
 
-    pub async fn send_frames(&mut self, frames: [EncodedFrame; N]) -> Result<(), PortRuntimeError> {
+    pub async fn send_frames(&mut self, frames: [EncodedFrame; N]) -> Result<(), DshotError> {
         let port_words = build_port_words(
             self.group_mask,
             self.pin_masks,
             frames,
             SignalPolarity::Normal,
         )
-        .map_err(PortRuntimeError::Frame)?;
+        .map_err(DshotError::Frame)?;
         self.tx_words = port_words.words;
         self.run_tx_dma().await
     }
 
-    async fn run_tx_dma(&mut self) -> Result<(), PortRuntimeError> {
-        let tx_timeout = self.cfg.tx_timeout;
+    async fn run_tx_dma(&mut self) -> Result<(), DshotError> {
+        let tx_timeout = self.config.tx_timeout;
         let session = TxPortSession::<T, D, N>::start(self)?;
         session.wait_done(tx_timeout).await
     }
@@ -612,7 +564,7 @@ where
     }
 }
 
-pub struct Stm32BidirPinController<'d, T, D>
+pub struct Stm32BidirDshotPort<'d, T, D>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -621,9 +573,7 @@ where
     dma_request: Request,
     pin: DshotPortPin<'d>,
     channel: Channel,
-    speed: DshotSpeed,
-    runtime_cfg: BidirPortRuntimeConfig,
-    capture_cfg: BidirCaptureConfig,
+    config: DshotConfig,
     tx_timer_cfg: PacerTimerConfig,
     rx_timer_cfg: PacerTimerConfig,
     rx_dma_cfg: PreparedRxDmaConfig,
@@ -634,7 +584,7 @@ where
     _dma: PhantomData<D>,
 }
 
-impl<'d, T, D> Stm32BidirPinController<'d, T, D>
+impl<'d, T, D> Stm32BidirDshotPort<'d, T, D>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -646,21 +596,31 @@ where
         (new_ch4, Ch4),
     }
 
-    pub fn with_runtime_config(mut self, runtime_cfg: BidirPortRuntimeConfig) -> Self {
-        self.set_runtime_config(runtime_cfg);
-        self
-    }
-
-    pub fn set_runtime_config(&mut self, runtime_cfg: BidirPortRuntimeConfig) {
-        self.runtime_cfg = runtime_cfg.normalized();
+    pub fn set_config(&mut self, config: DshotConfig) {
+        self.config = config;
         self.tx_timer_cfg = compute_pacer_timer_config(
             &self.timer,
-            self.speed.timing_hints().nominal_bitrate_hz * 3,
-            self.runtime_cfg.pacer_compare_percent,
+            self.config.speed.timing_hints().nominal_bitrate_hz * 3,
+            self.config.pacer_compare_percent,
         );
-        self.rx_timer_cfg =
-            compute_rx_timer_config(&self.timer, self.speed, self.runtime_cfg, self.capture_cfg);
+        self.rx_timer_cfg = compute_rx_timer_config(&self.timer, &self.config);
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
+
+        // Update decoder configuration
+        self.decoder = BidirDecoder::with_preamble_tuning(
+            self.config.oversampling,
+            self.config.preamble_tuning,
+        );
+
+        let sample_count = self
+            .config
+            .oversampling
+            .recommended_capture_samples(PREAMBLE_MARGIN_SAMPLES);
+        self.rx_dma_cfg = PreparedRxDmaConfig {
+            request: self.dma_request,
+            peri_addr: self.pin.idr_ptr(),
+            len: sample_count,
+        };
     }
 
     fn new_inner<C>(
@@ -668,56 +628,53 @@ where
         dma: Peri<'d, D>,
         _dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
         mut pin: DshotPortPin<'d>,
-        capture_cfg: BidirCaptureConfig,
         speed: DshotSpeed,
     ) -> Result<Self, PortConfigError>
     where
         C: TimerChannel,
         D: Dma<T, C>,
     {
-        if capture_cfg.sample_count == 0 || capture_cfg.sample_count > MAX_CAPTURE_SAMPLES {
-            return Err(PortConfigError::SampleBufferTooSmall {
-                requested: capture_cfg.sample_count,
-                capacity: MAX_CAPTURE_SAMPLES,
-            });
-        }
-
         let dma_request = dma.request();
         dma.remap();
         drop(dma);
 
         let timer = Timer::new(timer);
-        let runtime_cfg = BidirPortRuntimeConfig::default().normalized();
+        let config = DshotConfig::new(speed);
         let tx_timer_cfg = compute_pacer_timer_config(
             &timer,
             speed.timing_hints().nominal_bitrate_hz * 3,
-            runtime_cfg.pacer_compare_percent,
+            config.pacer_compare_percent,
         );
-        let rx_timer_cfg = compute_rx_timer_config(&timer, speed, runtime_cfg, capture_cfg);
+        let rx_timer_cfg = compute_rx_timer_config(&timer, &config);
         configure_pacer_timer(&timer, C::CHANNEL, tx_timer_cfg);
-        pin.enter_input(capture_cfg.pull);
+        pin.enter_input(config.pull);
         let pin_idr_ptr = pin.idr_ptr();
 
-        let mut decoder = BidirDecoder::with_preamble_tuning(
-            capture_cfg.oversampling,
-            capture_cfg.preamble_tuning,
-        );
-        decoder.set_stream_hint(capture_cfg.decode_hint);
+        let decoder =
+            BidirDecoder::with_preamble_tuning(config.oversampling, config.preamble_tuning);
+
+        let sample_count = config
+            .oversampling
+            .recommended_capture_samples(PREAMBLE_MARGIN_SAMPLES);
+        if sample_count > MAX_CAPTURE_SAMPLES {
+            return Err(PortConfigError::SampleBufferTooSmall {
+                requested: sample_count,
+                capacity: MAX_CAPTURE_SAMPLES,
+            });
+        }
 
         Ok(Self {
             timer,
             dma_request,
             pin,
             channel: C::CHANNEL,
-            speed,
-            runtime_cfg,
-            capture_cfg,
+            config,
             tx_timer_cfg,
             rx_timer_cfg,
             rx_dma_cfg: PreparedRxDmaConfig {
                 request: dma_request,
                 peri_addr: pin_idr_ptr,
-                len: capture_cfg.sample_count,
+                len: sample_count,
             },
             decoder,
             tx_words: [0; TX_STATE_SLOTS],
@@ -727,9 +684,9 @@ where
         })
     }
 
-    pub async fn arm_for(&mut self, duration: Duration) -> Result<(), PortRuntimeError> {
+    pub async fn arm_for(&mut self, duration: Duration) -> Result<(), DshotError> {
         let frame_period =
-            Duration::from_micros(self.speed.timing_hints().min_frame_period_us as u64);
+            Duration::from_micros(self.config.speed.timing_hints().min_frame_period_us as u64);
         let stop_frame = BidirTx::command(Command::MotorStop).encode();
         let deadline = Instant::now() + duration;
 
@@ -741,19 +698,19 @@ where
         Ok(())
     }
 
-    pub async fn arm(&mut self) -> Result<(), PortRuntimeError> {
+    pub async fn arm(&mut self) -> Result<(), DshotError> {
         self.arm_for(DEFAULT_ARM_DURATION).await
     }
 
     pub async fn send_throttle_and_receive(
         &mut self,
         throttle: u16,
-    ) -> Result<Result<TelemetryFrame, TelemetryPipelineError>, PortRuntimeError> {
+    ) -> Result<TelemetryFrame, DshotError> {
         self.send_frame_and_receive(BidirTx::throttle_clamped(throttle).encode())
             .await
     }
 
-    pub async fn send_frame(&mut self, frame: EncodedFrame) -> Result<(), PortRuntimeError> {
+    pub async fn send_frame(&mut self, frame: EncodedFrame) -> Result<(), DshotError> {
         self.prepare_bidir_frame(frame)?;
         self.run_tx_dma().await
     }
@@ -761,14 +718,14 @@ where
     pub async fn send_frame_and_receive(
         &mut self,
         frame: EncodedFrame,
-    ) -> Result<Result<TelemetryFrame, TelemetryPipelineError>, PortRuntimeError> {
+    ) -> Result<TelemetryFrame, DshotError> {
         self.prepare_bidir_frame(frame)?;
         self.run_tx_then_capture().await?;
         self.decode_captured_frame()
     }
 
-    async fn run_tx_dma(&mut self) -> Result<(), PortRuntimeError> {
-        let tx_timeout = self.runtime_cfg.tx_timeout;
+    async fn run_tx_dma(&mut self) -> Result<(), DshotError> {
+        let tx_timeout = self.config.tx_timeout;
         let session = TxPinSession::<T, D>::start(self)?;
         session.wait_done(tx_timeout).await
     }
@@ -778,14 +735,12 @@ where
         handle_tx_complete_irq::<D, T>(&this.timer, this.channel, &this.irq_state);
     }
 
-    async fn run_tx_then_capture(&mut self) -> Result<(), PortRuntimeError> {
-        let tx_timeout = self.runtime_cfg.tx_timeout;
-        let rx_timeout = self.runtime_cfg.rx_timeout;
+    async fn run_tx_then_capture(&mut self) -> Result<(), DshotError> {
+        let tx_timeout = self.config.tx_timeout;
+        let rx_timeout = self.config.rx_timeout;
         let total_timeout = tx_timeout + rx_timeout;
         let session = BidirCaptureSession::<T, D>::start(self)?;
 
-        // Single wait — the ISR transitions TxActive → RxActive → Done
-        // without waking the executor on the intermediate handoff.
         session.wait_done(total_timeout).await?;
 
         Ok(())
@@ -809,9 +764,7 @@ where
                 DmaStream::<D>::disable();
                 match this.irq_state.load_phase() {
                     IrqPhase::TxActive => {
-                        // Release the line so the ESC can seize it while we
-                        // reconfigure the timer and DMA for RX sampling.
-                        this.pin.enter_input(this.capture_cfg.pull);
+                        this.pin.enter_input(this.config.pull);
                         switch_pacer_timer_config_fast(
                             &this.timer,
                             this.channel,
@@ -821,13 +774,8 @@ where
                             this.rx_dma_cfg,
                             this.raw_samples.as_mut_ptr(),
                         );
-                        // Publish phase before enabling DMA so the RX-done
-                        // ISR (which may fire almost immediately) sees
-                        // RxActive rather than TxActive.
                         this.irq_state.set_phase(IrqPhase::RxActive);
                         this.timer.set_cc_dma_enable_state(this.channel, true);
-                        // No wake here — the task sleeps through the TX→RX
-                        // handoff and wakes only on RxDone/error.
                     }
                     IrqPhase::RxActive => {
                         this.timer.stop();
@@ -842,31 +790,30 @@ where
     }
 }
 
-impl<'d, T, D> Stm32BidirPinController<'d, T, D>
+impl<'d, T, D> Stm32BidirDshotPort<'d, T, D>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    fn prepare_bidir_frame(&mut self, frame: EncodedFrame) -> Result<(), PortRuntimeError> {
+    fn prepare_bidir_frame(&mut self, frame: EncodedFrame) -> Result<(), DshotError> {
         self.tx_words = build_port_words(
             self.pin.pin_mask(),
             [self.pin.pin_mask()],
             [frame],
             SignalPolarity::Inverted,
         )
-        .map_err(PortRuntimeError::Frame)?
+        .map_err(DshotError::Frame)?
         .words;
         Ok(())
     }
 
-    fn decode_captured_frame(
-        &mut self,
-    ) -> Result<Result<TelemetryFrame, TelemetryPipelineError>, PortRuntimeError> {
-        Ok(decode_frame_bf_strict_port_samples_u16(
+    fn decode_captured_frame(&mut self) -> Result<TelemetryFrame, DshotError> {
+        decode_frame_bf_strict_port_samples_u16(
             &mut self.decoder,
-            &self.raw_samples[..self.capture_cfg.sample_count],
+            &self.raw_samples[..self.rx_dma_cfg.len],
             self.pin.pin_mask() as u16,
-        ))
+        )
+        .map_err(DshotError::Telemetry)
     }
 }
 
@@ -1100,7 +1047,7 @@ where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    controller: &'a mut Stm32TxPortController<'d, T, D, N>,
+    controller: &'a mut Stm32DshotPort<'d, T, D, N>,
 }
 
 impl<'a, 'd, T, D, const N: usize> TxPortSession<'a, 'd, T, D, N>
@@ -1108,9 +1055,7 @@ where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    fn start(
-        controller: &'a mut Stm32TxPortController<'d, T, D, N>,
-    ) -> Result<Self, PortRuntimeError> {
+    fn start(controller: &'a mut Stm32DshotPort<'d, T, D, N>) -> Result<Self, DshotError> {
         for pin in &mut controller.pins {
             pin.enter_output_low();
         }
@@ -1122,7 +1067,7 @@ where
                 controller.channel,
                 controller.tx_timer_cfg,
                 &controller.irq_state,
-                Stm32TxPortController::<T, D, N>::tx_dma_irq,
+                Stm32DshotPort::<T, D, N>::tx_dma_irq,
                 ctx,
                 controller.dma_request,
                 &controller.tx_words,
@@ -1132,7 +1077,7 @@ where
         Ok(Self { controller })
     }
 
-    async fn wait_done(&self, timeout: Duration) -> Result<(), PortRuntimeError> {
+    async fn wait_done(&self, timeout: Duration) -> Result<(), DshotError> {
         self.controller.irq_state.wait_done(timeout).await
     }
 }
@@ -1158,7 +1103,7 @@ where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    controller: &'a mut Stm32BidirPinController<'d, T, D>,
+    controller: &'a mut Stm32BidirDshotPort<'d, T, D>,
 }
 
 impl<'a, 'd, T, D> TxPinSession<'a, 'd, T, D>
@@ -1166,9 +1111,7 @@ where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    fn start(
-        controller: &'a mut Stm32BidirPinController<'d, T, D>,
-    ) -> Result<Self, PortRuntimeError> {
+    fn start(controller: &'a mut Stm32BidirDshotPort<'d, T, D>) -> Result<Self, DshotError> {
         controller.pin.enter_output_high();
         let ctx = controller as *mut _ as *mut ();
         let bsrr = controller.pin.bsrr_ptr();
@@ -1178,7 +1121,7 @@ where
                 controller.channel,
                 controller.tx_timer_cfg,
                 &controller.irq_state,
-                Stm32BidirPinController::<T, D>::tx_only_dma_irq,
+                Stm32BidirDshotPort::<T, D>::tx_only_dma_irq,
                 ctx,
                 controller.dma_request,
                 &controller.tx_words,
@@ -1188,7 +1131,7 @@ where
         Ok(Self { controller })
     }
 
-    async fn wait_done(&self, timeout: Duration) -> Result<(), PortRuntimeError> {
+    async fn wait_done(&self, timeout: Duration) -> Result<(), DshotError> {
         self.controller.irq_state.wait_done(timeout).await
     }
 }
@@ -1204,7 +1147,7 @@ where
             self.controller.channel,
             &self.controller.irq_state,
             slice::from_mut(&mut self.controller.pin),
-            Some(self.controller.capture_cfg.pull),
+            Some(self.controller.config.pull),
         );
     }
 }
@@ -1214,7 +1157,7 @@ where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    controller: &'a mut Stm32BidirPinController<'d, T, D>,
+    controller: &'a mut Stm32BidirDshotPort<'d, T, D>,
 }
 
 impl<'a, 'd, T, D> BidirCaptureSession<'a, 'd, T, D>
@@ -1222,9 +1165,7 @@ where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    fn start(
-        controller: &'a mut Stm32BidirPinController<'d, T, D>,
-    ) -> Result<Self, PortRuntimeError> {
+    fn start(controller: &'a mut Stm32BidirDshotPort<'d, T, D>) -> Result<Self, DshotError> {
         controller.pin.enter_output_high();
         let ctx = controller as *mut _ as *mut ();
         let bsrr = controller.pin.bsrr_ptr();
@@ -1234,7 +1175,7 @@ where
                 controller.channel,
                 controller.tx_timer_cfg,
                 &controller.irq_state,
-                Stm32BidirPinController::<T, D>::dma_irq,
+                Stm32BidirDshotPort::<T, D>::dma_irq,
                 ctx,
                 controller.dma_request,
                 &controller.tx_words,
@@ -1244,7 +1185,7 @@ where
         Ok(Self { controller })
     }
 
-    async fn wait_done(&self, timeout: Duration) -> Result<(), PortRuntimeError> {
+    async fn wait_done(&self, timeout: Duration) -> Result<(), DshotError> {
         self.controller.irq_state.wait_done(timeout).await
     }
 }
@@ -1260,7 +1201,7 @@ where
             self.controller.channel,
             &self.controller.irq_state,
             slice::from_mut(&mut self.controller.pin),
-            Some(self.controller.capture_cfg.pull),
+            Some(self.controller.config.pull),
         );
     }
 }
@@ -1342,18 +1283,15 @@ fn compute_pacer_timer_config<T: GeneralInstance4Channel>(
 
 fn compute_rx_timer_config<T: GeneralInstance4Channel>(
     timer: &Timer<'_, T>,
-    speed: DshotSpeed,
-    runtime_cfg: BidirPortRuntimeConfig,
-    capture_cfg: BidirCaptureConfig,
+    config: &DshotConfig,
 ) -> PacerTimerConfig {
     // Match Betaflight's telemetry input pacing:
     // inputFreq = outputFreq * 5 * 2 * oversample / 24
     // For the BF default oversample=3, this becomes outputFreq * 5 / 4.
-    let symbol_rate_hz = speed.timing_hints().nominal_bitrate_hz;
-    let mut rx_sample_hz = symbol_rate_hz * 5 * capture_cfg.oversampling.oversampling as u32 / 4;
-    rx_sample_hz =
-        rx_sample_hz.saturating_mul(runtime_cfg.rx_sample_percent.clamp(1, 200) as u32) / 100;
-    compute_pacer_timer_config(timer, rx_sample_hz, runtime_cfg.rx_compare_percent)
+    let symbol_rate_hz = config.speed.timing_hints().nominal_bitrate_hz;
+    let mut rx_sample_hz = symbol_rate_hz * 5 * config.oversampling.oversampling as u32 / 4;
+    rx_sample_hz = rx_sample_hz.saturating_mul(config.rx_sample_percent.clamp(1, 200) as u32) / 100;
+    compute_pacer_timer_config(timer, rx_sample_hz, config.rx_compare_percent)
 }
 
 pub const FRAME_BITS: usize = 16;

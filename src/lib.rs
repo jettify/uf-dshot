@@ -4,7 +4,6 @@ mod bidir_capture;
 pub mod command;
 #[cfg(all(feature = "embassy-stm32", target_arch = "arm", target_os = "none"))]
 pub mod embassy_stm32;
-pub mod proto;
 pub mod telemetry;
 
 pub use command::{
