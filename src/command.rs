@@ -109,7 +109,7 @@ impl Command {
             | Command::SignalLineTelemetryEnable
             | Command::SignalLineTelemetryDisable
             | Command::SignalLineContinuousERPMTelemetry
-            | Command::SignalLineContinuousERPMPeriodTelemetry => 6,
+            | Command::SignalLineContinuousERPMPeriodTelemetry => 10,
             _ => 1,
         }
     }
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(Command::Beep1.min_delay_us(), 260_000);
         assert_eq!(Command::Beep1.min_repetitions(), 1);
         assert_eq!(Command::SettingsSave.min_delay_us(), 35_000);
-        assert_eq!(Command::SettingsSave.min_repetitions(), 6);
+        assert_eq!(Command::SettingsSave.min_repetitions(), 10);
     }
 
     #[test]
