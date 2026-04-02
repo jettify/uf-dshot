@@ -81,6 +81,7 @@ ci:
 ci-stm32:
   cargo check --manifest-path examples/dshot-simple-stm32/Cargo.toml --target thumbv7em-none-eabihf
   cargo check --manifest-path examples/bdshot-simple-stm32/Cargo.toml --target thumbv7em-none-eabihf
+  cargo check --manifest-path examples/bdshot-stm32/Cargo.toml --target thumbv7em-none-eabihf
 
 [group('test')]
 coverage:
