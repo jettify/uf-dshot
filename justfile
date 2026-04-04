@@ -75,6 +75,7 @@ ci:
   cargo check
   cargo build
   cargo test --all-features
+  just examples
   just ci-stm32
 
 [group('test')]
@@ -82,6 +83,12 @@ ci-stm32:
   cargo check --manifest-path examples/dshot-simple-stm32/Cargo.toml --target thumbv7em-none-eabihf
   cargo check --manifest-path examples/bdshot-simple-stm32/Cargo.toml --target thumbv7em-none-eabihf
   cargo check --manifest-path examples/bdshot-stm32/Cargo.toml --target thumbv7em-none-eabihf
+
+[group('test')]
+examples:
+  cargo run --example=local_command
+  cargo run --example=local_telemetry
+  cargo run --example=local_telemetry_oversampling
 
 [group('test')]
 coverage:
