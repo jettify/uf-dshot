@@ -24,7 +24,6 @@ pub use telemetry::{
     OversamplingConfig,
     PreambleTuningConfig,
     TelemetryError,
-    TelemetryDecoderStats,
     TelemetryFrame,
     parse_telemetry_payload,
 };
