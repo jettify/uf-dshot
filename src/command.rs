@@ -5,6 +5,7 @@ const FRAME_BITS: usize = 16;
 const CRC_MASK_4BIT: u16 = 0x0F;
 // DShot reserves 0..=47 for commands; throttle starts at 48.
 const THROTTLE_VALUE_OFFSET: u16 = 48;
+const THROTTLE_MAX_RAW: u16 = 1999;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -140,53 +141,109 @@ impl Command {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Throttle(u16);
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ThrottleError {
     OutOfRange { raw: u16 },
 }
 
-impl Throttle {
-    pub const MIN: u16 = 0;
-    pub const MAX: u16 = 1999;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DshotMode {
+    Standard,
+    Bidirectional,
+}
 
-    pub fn try_new(raw: u16) -> Result<Self, ThrottleError> {
-        if raw > Self::MAX {
-            Err(ThrottleError::OutOfRange { raw })
-        } else {
-            Ok(Self(raw))
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DshotTx {
+    mode: DshotMode,
+    request_separate_wire_telemetry: bool,
+}
+
+impl DshotTx {
+    pub const fn standard() -> Self {
+        Self {
+            mode: DshotMode::Standard,
+            request_separate_wire_telemetry: false,
         }
     }
 
-    pub fn new_clamped(raw: u16) -> Self {
-        Self(raw.clamp(Self::MIN, Self::MAX))
+    pub const fn bidirectional() -> Self {
+        Self {
+            mode: DshotMode::Bidirectional,
+            request_separate_wire_telemetry: false,
+        }
     }
 
-    pub const fn get(self) -> u16 {
-        self.0
+    pub const fn mode(mode: DshotMode) -> Self {
+        match mode {
+            DshotMode::Standard => Self::standard(),
+            DshotMode::Bidirectional => Self::bidirectional(),
+        }
     }
-}
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum FrameValue {
-    Throttle(Throttle),
-    Command(Command),
-}
+    pub const fn dshot_mode(self) -> DshotMode {
+        self.mode
+    }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct UniTx {
-    pub value: FrameValue,
-    pub request_separate_wire_telemetry: bool,
-}
+    pub const fn with_telemetry_request(mut self, enabled: bool) -> Self {
+        if matches!(self.mode, DshotMode::Standard) {
+            self.request_separate_wire_telemetry = enabled;
+        }
+        self
+    }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct BidirTx {
-    pub value: FrameValue,
+    pub const fn telemetry_request(self) -> bool {
+        match self.mode {
+            DshotMode::Standard => self.request_separate_wire_telemetry,
+            DshotMode::Bidirectional => true,
+        }
+    }
+
+    pub fn throttle(self, raw: u16) -> Result<EncodedFrame, ThrottleError> {
+        if raw > THROTTLE_MAX_RAW {
+            return Err(ThrottleError::OutOfRange { raw });
+        }
+        Ok(self.encode_raw_value(raw + THROTTLE_VALUE_OFFSET, None))
+    }
+
+    pub fn throttle_clamped(self, raw: u16) -> EncodedFrame {
+        self.encode_raw_value(raw.min(THROTTLE_MAX_RAW) + THROTTLE_VALUE_OFFSET, None)
+    }
+
+    pub fn throttle_with_telemetry_request(
+        self,
+        raw: u16,
+        enabled: bool,
+    ) -> Result<EncodedFrame, ThrottleError> {
+        if raw > THROTTLE_MAX_RAW {
+            return Err(ThrottleError::OutOfRange { raw });
+        }
+        Ok(self.encode_raw_value(raw + THROTTLE_VALUE_OFFSET, Some(enabled)))
+    }
+
+    pub fn command(self, command: Command) -> EncodedFrame {
+        self.encode_raw_value(command as u16, None)
+    }
+
+    fn encode_raw_value(self, raw_value: u16, telemetry_override: Option<bool>) -> EncodedFrame {
+        let telemetry_bit = match self.mode {
+            DshotMode::Standard => {
+                telemetry_override.unwrap_or(self.request_separate_wire_telemetry)
+            }
+            DshotMode::Bidirectional => true,
+        };
+
+        let data_12 = encode_data_12(raw_value, telemetry_bit);
+        let base = base_crc(data_12);
+        let crc_4 = match self.mode {
+            DshotMode::Standard => base,
+            DshotMode::Bidirectional => (!base) & 0x0F,
+        };
+
+        EncodedFrame {
+            payload: (data_12 << 4) | u16::from(crc_4),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -284,75 +341,7 @@ impl EncodedFrame {
     }
 }
 
-impl UniTx {
-    pub const fn new(value: FrameValue, request_separate_wire_telemetry: bool) -> Self {
-        Self {
-            value,
-            request_separate_wire_telemetry,
-        }
-    }
-
-    pub fn throttle(raw: u16) -> Result<Self, ThrottleError> {
-        let throttle = Throttle::try_new(raw)?;
-        Ok(Self::new(FrameValue::Throttle(throttle), false))
-    }
-
-    pub fn throttle_clamped(raw: u16) -> Self {
-        Self::new(FrameValue::Throttle(Throttle::new_clamped(raw)), false)
-    }
-
-    pub const fn command(command: Command) -> Self {
-        Self::new(FrameValue::Command(command), false)
-    }
-
-    pub const fn with_telemetry_request(mut self, enabled: bool) -> Self {
-        self.request_separate_wire_telemetry = enabled;
-        self
-    }
-
-    pub fn encode(self) -> EncodedFrame {
-        let data_12 = encode_data_12(self.value, self.request_separate_wire_telemetry);
-        let crc_4 = base_crc(data_12);
-        let payload = (data_12 << 4) | u16::from(crc_4);
-
-        EncodedFrame { payload }
-    }
-}
-
-impl BidirTx {
-    pub const fn new(value: FrameValue) -> Self {
-        Self { value }
-    }
-
-    pub fn throttle(raw: u16) -> Result<Self, ThrottleError> {
-        let throttle = Throttle::try_new(raw)?;
-        Ok(Self::new(FrameValue::Throttle(throttle)))
-    }
-
-    pub fn throttle_clamped(raw: u16) -> Self {
-        Self::new(FrameValue::Throttle(Throttle::new_clamped(raw)))
-    }
-
-    pub const fn command(command: Command) -> Self {
-        Self::new(FrameValue::Command(command))
-    }
-
-    pub fn encode(self) -> EncodedFrame {
-        // Bidirectional DShot always sets the telemetry bit in the TX frame.
-        let data_12 = encode_data_12(self.value, true);
-        let crc_4 = (!base_crc(data_12)) & 0x0F;
-        let payload = (data_12 << 4) | u16::from(crc_4);
-
-        EncodedFrame { payload }
-    }
-}
-
-fn encode_data_12(value: FrameValue, telemetry_request: bool) -> u16 {
-    let raw_value = match value {
-        FrameValue::Command(c) => c as u16,
-        FrameValue::Throttle(t) => t.get() + THROTTLE_VALUE_OFFSET,
-    };
-
+fn encode_data_12(raw_value: u16, telemetry_request: bool) -> u16 {
     (raw_value << 1) | u16::from(telemetry_request)
 }
 
@@ -366,13 +355,14 @@ mod tests {
 
     #[test]
     fn throttle_checked_and_clamped() {
-        assert_eq!(Throttle::try_new(0), Ok(Throttle(0)));
-        assert_eq!(Throttle::try_new(1999), Ok(Throttle(1999)));
         assert_eq!(
-            Throttle::try_new(2000),
+            DshotTx::bidirectional().throttle(2000),
             Err(ThrottleError::OutOfRange { raw: 2000 })
         );
-        assert_eq!(Throttle::new_clamped(5000).get(), 1999);
+        assert_eq!(
+            DshotTx::bidirectional().throttle_clamped(5000).data_12(),
+            0xFFF
+        );
     }
 
     #[test]
@@ -385,7 +375,7 @@ mod tests {
 
     #[test]
     fn dshot_crc_vector() {
-        let frame = UniTx::throttle(1000).unwrap().encode();
+        let frame = DshotTx::standard().throttle(1000).unwrap();
         assert_eq!(frame.payload, 0x830B);
         assert_eq!(frame.data_12(), 0x830);
         assert_eq!(frame.crc_4(), 0xB);
@@ -393,10 +383,10 @@ mod tests {
 
     #[test]
     fn dshot_crc_with_telemetry_request_vector() {
-        let frame = UniTx::throttle(1000)
-            .unwrap()
+        let frame = DshotTx::standard()
             .with_telemetry_request(true)
-            .encode();
+            .throttle(1000)
+            .unwrap();
         assert_eq!(frame.payload, 0x831A);
         assert_eq!(frame.data_12(), 0x831);
         assert_eq!(frame.crc_4(), 0xA);
@@ -404,7 +394,7 @@ mod tests {
 
     #[test]
     fn bidir_inverted_crc_vector() {
-        let frame = BidirTx::throttle(1000).unwrap().encode();
+        let frame = DshotTx::bidirectional().throttle(1000).unwrap();
         assert_eq!(frame.payload, 0x8315);
         assert_eq!(frame.data_12(), 0x831);
         assert_eq!(frame.crc_4(), 0x5);
@@ -412,18 +402,18 @@ mod tests {
 
     #[test]
     fn throttle_zero_does_not_overlap_max_command() {
-        let throttle_zero = UniTx::throttle(0).unwrap().encode().data_12();
-        let max_command = UniTx::command(Command::SignalLineERPMPeriodTelemetry)
-            .encode()
+        let throttle_zero = DshotTx::standard().throttle(0).unwrap().data_12();
+        let max_command = DshotTx::standard()
+            .command(Command::SignalLineERPMPeriodTelemetry)
             .data_12();
         assert_ne!(throttle_zero, max_command);
     }
 
     #[test]
     fn bits_msb_first_order_matches_payload() {
-        let frame = UniTx::command(Command::Beep1)
+        let frame = DshotTx::standard()
             .with_telemetry_request(true)
-            .encode();
+            .command(Command::Beep1);
         assert_eq!(frame.payload, 0x0033);
         assert_eq!(
             frame.bits_msb_first(),
@@ -436,9 +426,9 @@ mod tests {
 
     #[test]
     fn waveform_ticks_mapping_and_reset_slot() {
-        let frame = UniTx::command(Command::Beep1)
+        let frame = DshotTx::standard()
             .with_telemetry_request(true)
-            .encode();
+            .command(Command::Beep1);
         let timing = WaveformTiming {
             period_ticks: 100,
             bit0_high_ticks: 37,
@@ -471,5 +461,21 @@ mod tests {
         let policy = Command::EscInfo.exec_policy();
         assert_eq!(policy.min_gap(), Duration::from_micros(12_000));
         assert_eq!(policy.repeat_count().get(), 1);
+    }
+
+    #[test]
+    fn per_frame_standard_telemetry_override_works() {
+        let tx = DshotTx::standard().with_telemetry_request(false);
+        let no_telem = tx.throttle(1000).unwrap();
+        let with_telem = tx.throttle_with_telemetry_request(1000, true).unwrap();
+        assert_eq!(no_telem.data_12(), 0x830);
+        assert_eq!(with_telem.data_12(), 0x831);
+    }
+
+    #[test]
+    fn bidir_forces_telemetry_even_when_override_is_false() {
+        let tx = DshotTx::bidirectional();
+        let frame = tx.throttle_with_telemetry_request(1000, false).unwrap();
+        assert_eq!(frame.data_12(), 0x831);
     }
 }

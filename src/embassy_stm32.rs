@@ -19,9 +19,9 @@ use embassy_time::{with_timeout, Duration, Instant, Timer as EmbassyTimer};
 
 use crate::bidir_capture::decode_frame_strict_port_samples_u16;
 use crate::telemetry::{
-    BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryFrame, TelemetryPipelineError,
+    BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryError, TelemetryFrame,
 };
-use crate::{BidirTx, Command, DshotSpeed, EncodedFrame, UniTx};
+use crate::{Command, DshotSpeed, DshotTx, EncodedFrame};
 
 const MAX_PORT_MOTORS: usize = 4;
 const MAX_CAPTURE_SAMPLES: usize = 512;
@@ -81,7 +81,7 @@ pub enum DshotError {
     RxDmaError,
     RxTimeout,
     Frame(PortFrameError),
-    Telemetry(TelemetryPipelineError),
+    Telemetry(TelemetryError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,7 +520,7 @@ where
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), DshotError> {
         let frame_period =
             Duration::from_micros(self.config.speed.timing_hints().min_frame_period_us as u64);
-        let stop_frames = [UniTx::command(Command::MotorStop).encode(); N];
+        let stop_frames = [DshotTx::standard().command(Command::MotorStop); N];
         let deadline = Instant::now() + duration;
 
         while Instant::now() < deadline {
@@ -536,7 +536,7 @@ where
     }
 
     pub async fn send_throttles(&mut self, throttles: [u16; N]) -> Result<(), DshotError> {
-        self.send_frames(throttles.map(|throttle| UniTx::throttle_clamped(throttle).encode()))
+        self.send_frames(throttles.map(|throttle| DshotTx::standard().throttle_clamped(throttle)))
             .await
     }
 
@@ -688,7 +688,7 @@ where
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), DshotError> {
         let frame_period =
             Duration::from_micros(self.config.speed.timing_hints().min_frame_period_us as u64);
-        let stop_frame = BidirTx::command(Command::MotorStop).encode();
+        let stop_frame = DshotTx::bidirectional().command(Command::MotorStop);
         let deadline = Instant::now() + duration;
 
         while Instant::now() < deadline {
@@ -707,7 +707,7 @@ where
         &mut self,
         throttle: u16,
     ) -> Result<TelemetryFrame, DshotError> {
-        self.send_frame_and_receive(BidirTx::throttle_clamped(throttle).encode())
+        self.send_frame_and_receive(DshotTx::bidirectional().throttle_clamped(throttle))
             .await
     }
 
@@ -814,7 +814,7 @@ where
             &self.raw_samples[..self.rx_dma_cfg.len],
             self.pin.pin_mask() as u16,
         )
-        .map_err(DshotError::Telemetry)
+        .map_err(|err| DshotError::Telemetry(err.into()))
     }
 }
 
@@ -1400,11 +1400,11 @@ fn apply_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BidirTx, UniTx};
+    use crate::DshotTx;
 
     #[test]
     fn normal_words_match_three_state_layout() {
-        let frame = UniTx::throttle(0).unwrap().encode();
+        let frame = DshotTx::standard().throttle(0).unwrap();
         let out = build_port_words(1 << 3, [1 << 3], [frame], SignalPolarity::Normal).unwrap();
 
         assert_eq!(out.words[0], 1 << 3);
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn zero_bits_clear_in_middle_slot() {
-        let frame = UniTx::command(crate::Command::MotorStop).encode();
+        let frame = DshotTx::standard().command(crate::Command::MotorStop);
         let out = build_port_words(1 << 8, [1 << 8], [frame], SignalPolarity::Normal).unwrap();
 
         assert_eq!(out.words[1], 1 << 24);
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn inverted_mode_flips_idle_and_clear_masks() {
-        let frame = BidirTx::throttle(100).unwrap().encode();
+        let frame = DshotTx::bidirectional().throttle(100).unwrap();
         let out = build_port_words(1 << 2, [1 << 2], [frame], SignalPolarity::Inverted).unwrap();
 
         assert_eq!(out.words[0], 1 << 18);
@@ -1432,7 +1432,7 @@ mod tests {
 
     #[test]
     fn pin_mask_must_be_subset_of_group_mask() {
-        let frame = UniTx::command(crate::Command::MotorStop).encode();
+        let frame = DshotTx::standard().command(crate::Command::MotorStop);
         let err = build_port_words(
             1 << 3,
             [(1 << 3) | (1 << 4)],

@@ -1,40 +1,30 @@
 #![no_std]
 
 mod bidir_capture;
-pub mod command;
+mod command;
 #[cfg(all(feature = "embassy-stm32", target_arch = "arm", target_os = "none"))]
 pub mod embassy_stm32;
-pub mod telemetry;
+mod telemetry;
 
 pub use command::{
-    // comment just to make one item per line
-    BidirTx,
     Command,
+    CommandTiming,
+    DshotMode,
     DshotSpeed,
+    DshotTx,
     EncodedFrame,
     FrameTimingHints,
-    FrameValue,
-    Throttle,
     ThrottleError,
-    UniTx,
     WaveformTicks,
     WaveformTiming,
 };
 pub use telemetry::{
-    // comment just to make one item per line
     BidirDecoder,
-    DecodeHint,
-    DecodedTelemetry,
     ErpmReading,
-    GcrDecodeError,
-    GcrDecodeResult,
-    GcrFrame,
     OversamplingConfig,
-    PayloadParseError,
     PreambleTuningConfig,
-    SampleDecodeError,
+    TelemetryError,
     TelemetryDecoderStats,
     TelemetryFrame,
-    TelemetryPayload,
-    TelemetryPipelineError,
+    parse_telemetry_payload,
 };

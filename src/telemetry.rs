@@ -68,20 +68,20 @@ pub struct TelemetryDecoderStats {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct GcrFrame {
+pub(crate) struct GcrFrame {
     pub raw_21: u32,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct GcrDecodeResult {
+pub(crate) struct GcrDecodeResult {
     pub frame: GcrFrame,
     pub start_margin: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct TelemetryPayload {
+pub(crate) struct TelemetryPayload {
     pub raw_16: u16,
 }
 
@@ -133,15 +133,15 @@ pub enum TelemetryFrame {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct DecodedTelemetry {
-    pub gcr: GcrDecodeResult,
-    pub payload: TelemetryPayload,
+pub(crate) struct DecodedTelemetry {
+    pub(crate) gcr: GcrDecodeResult,
+    pub(crate) payload: TelemetryPayload,
     pub frame: TelemetryFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum SampleDecodeError {
+pub(crate) enum SampleDecodeError {
     InvalidSampleBitIndex { bit: u8 },
     InvalidConfig,
     NoEdge,
@@ -151,25 +151,83 @@ pub enum SampleDecodeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum GcrDecodeError {
+pub(crate) enum GcrDecodeError {
     InvalidGcrSymbol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum PayloadParseError {
+pub(crate) enum PayloadParseError {
     InvalidCrc { calculated_crc: u8, packet_crc: u8 },
     InvalidErpmPeriod,
 }
 
-pub type TelemetryError = PayloadParseError;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TelemetryError {
+    InvalidSampleBitIndex { bit: u8 },
+    InvalidConfig,
+    NoEdge,
+    FrameTooShort,
+    InvalidFrame,
+    InvalidGcrSymbol,
+    InvalidCrc { calculated_crc: u8, packet_crc: u8 },
+    InvalidErpmPeriod,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum TelemetryPipelineError {
+pub(crate) enum TelemetryPipelineError {
     Samples(SampleDecodeError),
     GcrDecode(GcrDecodeError),
     PayloadParse(PayloadParseError),
+}
+
+impl From<SampleDecodeError> for TelemetryError {
+    fn from(err: SampleDecodeError) -> Self {
+        match err {
+            SampleDecodeError::InvalidSampleBitIndex { bit } => {
+                TelemetryError::InvalidSampleBitIndex { bit }
+            }
+            SampleDecodeError::InvalidConfig => TelemetryError::InvalidConfig,
+            SampleDecodeError::NoEdge => TelemetryError::NoEdge,
+            SampleDecodeError::FrameTooShort => TelemetryError::FrameTooShort,
+            SampleDecodeError::InvalidFrame => TelemetryError::InvalidFrame,
+        }
+    }
+}
+
+impl From<GcrDecodeError> for TelemetryError {
+    fn from(err: GcrDecodeError) -> Self {
+        match err {
+            GcrDecodeError::InvalidGcrSymbol => TelemetryError::InvalidGcrSymbol,
+        }
+    }
+}
+
+impl From<PayloadParseError> for TelemetryError {
+    fn from(err: PayloadParseError) -> Self {
+        match err {
+            PayloadParseError::InvalidCrc {
+                calculated_crc,
+                packet_crc,
+            } => TelemetryError::InvalidCrc {
+                calculated_crc,
+                packet_crc,
+            },
+            PayloadParseError::InvalidErpmPeriod => TelemetryError::InvalidErpmPeriod,
+        }
+    }
+}
+
+impl From<TelemetryPipelineError> for TelemetryError {
+    fn from(err: TelemetryPipelineError) -> Self {
+        match err {
+            TelemetryPipelineError::Samples(e) => e.into(),
+            TelemetryPipelineError::GcrDecode(e) => e.into(),
+            TelemetryPipelineError::PayloadParse(e) => e.into(),
+        }
+    }
 }
 
 const STREAM_BUFFER_CAPACITY: usize = 256;
@@ -256,7 +314,7 @@ impl BidirDecoder {
         }
     }
 
-    pub fn decode(
+    pub(crate) fn decode(
         &self,
         samples: &[u16],
         hint: DecodeHint,
@@ -278,124 +336,54 @@ impl BidirDecoder {
         })
     }
 
-    pub fn decode_frame(
+    pub fn decode_frame(&self, samples: &[u16]) -> Result<TelemetryFrame, TelemetryError> {
+        self.decode(samples, DecodeHint::default())
+            .map(|decoded| decoded.frame)
+            .map_err(Into::into)
+    }
+
+    pub fn decode_frame_with_hint(
         &self,
         samples: &[u16],
         hint: DecodeHint,
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        let gcr = self
-            .decode_gcr(samples, hint)
-            .map_err(TelemetryPipelineError::Samples)?;
-        let payload = self
-            .decode_payload(gcr.frame)
-            .map_err(TelemetryPipelineError::GcrDecode)?;
-        self.parse_payload(payload)
-            .map_err(TelemetryPipelineError::PayloadParse)
+    ) -> Result<TelemetryFrame, TelemetryError> {
+        self.decode(samples, hint)
+            .map(|decoded| decoded.frame)
+            .map_err(Into::into)
     }
 
     pub fn decode_frame_tuned(
         &mut self,
         samples: &[u16],
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        let mut hint = self.stream_tuning_state.hint;
-        if hint.preamble_skip >= samples.len() {
-            hint.preamble_skip = samples.len().saturating_sub(1);
-        }
-
-        match self.decode(samples, hint) {
-            Ok(decoded) => {
-                self.observe_start_margin(decoded.gcr.start_margin);
-                Ok(decoded.frame)
-            }
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
-                self.observe_no_edge();
-                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-            }
-            Err(err) => Err(err),
-        }
+    ) -> Result<TelemetryFrame, TelemetryError> {
+        let hint = self.bounded_stream_hint(samples.len());
+        let result = self.decode(samples, hint);
+        self.finish_tuned_decode(result).map_err(Into::into)
     }
 
     pub fn decode_frame_tuned_port_samples(
         &mut self,
         samples: &[u32],
         bit_mask: u32,
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        let len = samples.len().min(self.stream_buf.len());
-        let sample_level_mask = if self.cfg.sample_bit_index < 16 {
-            1u16 << self.cfg.sample_bit_index
-        } else {
-            1
-        };
-        for (dst, sample) in self.stream_buf[..len]
-            .iter_mut()
-            .zip(samples.iter().copied())
-        {
-            *dst = if (sample & bit_mask) != 0 {
-                sample_level_mask
-            } else {
-                0
-            };
-        }
-
-        let mut hint = self.stream_tuning_state.hint;
-        if hint.preamble_skip >= len {
-            hint.preamble_skip = len.saturating_sub(1);
-        }
-
-        match self.decode(&self.stream_buf[..len], hint) {
-            Ok(decoded) => {
-                self.observe_start_margin(decoded.gcr.start_margin);
-                Ok(decoded.frame)
-            }
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
-                self.observe_no_edge();
-                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-            }
-            Err(err) => Err(err),
-        }
+    ) -> Result<TelemetryFrame, TelemetryError> {
+        let len = self.fill_stream_buf_from_port_samples(samples, bit_mask);
+        let hint = self.bounded_stream_hint(len);
+        let result = self.decode(&self.stream_buf[..len], hint);
+        self.finish_tuned_decode(result).map_err(Into::into)
     }
 
     pub fn decode_frame_tuned_port_samples_u16(
         &mut self,
         samples: &[u16],
         bit_mask: u16,
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        let len = samples.len().min(self.stream_buf.len());
-        let sample_level_mask = if self.cfg.sample_bit_index < 16 {
-            1u16 << self.cfg.sample_bit_index
-        } else {
-            1
-        };
-        for (dst, sample) in self.stream_buf[..len]
-            .iter_mut()
-            .zip(samples.iter().copied())
-        {
-            *dst = if (sample & bit_mask) != 0 {
-                sample_level_mask
-            } else {
-                0
-            };
-        }
-
-        let mut hint = self.stream_tuning_state.hint;
-        if hint.preamble_skip >= len {
-            hint.preamble_skip = len.saturating_sub(1);
-        }
-
-        match self.decode(&self.stream_buf[..len], hint) {
-            Ok(decoded) => {
-                self.observe_start_margin(decoded.gcr.start_margin);
-                Ok(decoded.frame)
-            }
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
-                self.observe_no_edge();
-                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-            }
-            Err(err) => Err(err),
-        }
+    ) -> Result<TelemetryFrame, TelemetryError> {
+        let len = self.fill_stream_buf_from_port_samples(samples, u32::from(bit_mask));
+        let hint = self.bounded_stream_hint(len);
+        let result = self.decode(&self.stream_buf[..len], hint);
+        self.finish_tuned_decode(result).map_err(Into::into)
     }
 
-    pub fn decode_frame_from_gcr_tuned(
+    pub(crate) fn decode_frame_from_gcr_tuned(
         &mut self,
         gcr: Result<GcrDecodeResult, SampleDecodeError>,
     ) -> Result<TelemetryFrame, TelemetryPipelineError> {
@@ -418,7 +406,7 @@ impl BidirDecoder {
         }
     }
 
-    pub fn decode_gcr(
+    pub(crate) fn decode_gcr(
         &self,
         samples: &[u16],
         hint: DecodeHint,
@@ -426,21 +414,21 @@ impl BidirDecoder {
         decode_gcr_from_samples_cfg(samples, hint, self.cfg)
     }
 
-    pub fn decode_payload(&self, gcr: GcrFrame) -> Result<TelemetryPayload, GcrDecodeError> {
+    pub(crate) fn decode_payload(&self, gcr: GcrFrame) -> Result<TelemetryPayload, GcrDecodeError> {
         match decode_gcr(gcr.raw_21) {
             Some(raw_16) => Ok(TelemetryPayload { raw_16 }),
             None => Err(GcrDecodeError::InvalidGcrSymbol),
         }
     }
 
-    pub fn parse_payload(
+    pub(crate) fn parse_payload(
         &self,
         payload: TelemetryPayload,
     ) -> Result<TelemetryFrame, PayloadParseError> {
-        parse_telemetry_payload(payload.raw_16)
+        parse_telemetry_payload_inner(payload.raw_16)
     }
 
-    pub fn push_sample(
+    pub(crate) fn push_sample(
         &mut self,
         sample: u16,
     ) -> Option<Result<DecodedTelemetry, TelemetryPipelineError>> {
@@ -519,9 +507,9 @@ impl BidirDecoder {
     pub fn push_sample_frame(
         &mut self,
         sample: u16,
-    ) -> Option<Result<TelemetryFrame, TelemetryPipelineError>> {
+    ) -> Option<Result<TelemetryFrame, TelemetryError>> {
         self.push_sample(sample)
-            .map(|result| result.map(|decoded| decoded.frame))
+            .map(|result| result.map(|decoded| decoded.frame).map_err(Into::into))
     }
 
     pub const fn stream_hint(&self) -> DecodeHint {
@@ -542,6 +530,58 @@ impl BidirDecoder {
 
     fn reset_stream(&mut self) {
         self.stream_len = 0;
+    }
+
+    fn finish_tuned_decode(
+        &mut self,
+        result: Result<DecodedTelemetry, TelemetryPipelineError>,
+    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
+        match result {
+            Ok(decoded) => {
+                self.observe_start_margin(decoded.gcr.start_margin);
+                Ok(decoded.frame)
+            }
+            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge)) => {
+                self.observe_no_edge();
+                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn bounded_stream_hint(&self, len: usize) -> DecodeHint {
+        let mut hint = self.stream_tuning_state.hint;
+        if hint.preamble_skip >= len {
+            hint.preamble_skip = len.saturating_sub(1);
+        }
+        hint
+    }
+
+    fn sample_level_mask(&self) -> u16 {
+        if self.cfg.sample_bit_index < 16 {
+            1u16 << self.cfg.sample_bit_index
+        } else {
+            1
+        }
+    }
+
+    fn fill_stream_buf_from_port_samples<T>(&mut self, samples: &[T], bit_mask: u32) -> usize
+    where
+        T: Copy + Into<u32>,
+    {
+        let len = samples.len().min(self.stream_buf.len());
+        let sample_level_mask = self.sample_level_mask();
+        for (dst, sample) in self.stream_buf[..len]
+            .iter_mut()
+            .zip(samples.iter().copied())
+        {
+            *dst = if (sample.into() & bit_mask) != 0 {
+                sample_level_mask
+            } else {
+                0
+            };
+        }
+        len
     }
 
     fn observe_start_margin(&mut self, start_margin: usize) {
@@ -589,7 +629,11 @@ fn calculate_telemetry_crc(value: u16) -> u8 {
     (!calculate_crc(value)) & 0x0F
 }
 
-pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, PayloadParseError> {
+pub fn parse_telemetry_payload(payload: u16) -> Result<TelemetryFrame, TelemetryError> {
+    parse_telemetry_payload_inner(payload).map_err(Into::into)
+}
+
+fn parse_telemetry_payload_inner(payload: u16) -> Result<TelemetryFrame, PayloadParseError> {
     let data = payload >> PAYLOAD_DATA_SHIFT;
     let packet_crc = (payload & PAYLOAD_CRC_MASK) as u8;
     let calculated_crc = calculate_telemetry_crc(data);
@@ -639,9 +683,8 @@ const fn is_extended_telemetry(exponent: u16, mantissa: u16) -> bool {
     (exponent & EXTENDED_EXPONENT_FLAG_MASK) != 0 && (mantissa & EXTENDED_MANTISSA_FLAG_MASK) == 0
 }
 
-/// Convert a telemetry eRPM period into eRPM * 100.
-/// Returns 0 if the period is zero.
-pub fn erpm_period_to_erpm_x100(period: u16) -> u32 {
+#[cfg(test)]
+fn erpm_period_to_erpm_x100(period: u16) -> u32 {
     if period == 0 {
         return 0;
     }
@@ -649,30 +692,30 @@ pub fn erpm_period_to_erpm_x100(period: u16) -> u32 {
     (1_000_000 * 60 / 100 + period / 2) / period
 }
 
-/// Convert eRPM * 100 into mechanical RPM for a given number of pole pairs.
-pub fn erpm_x100_to_rpm(erpm_x100: u32, pole_pairs: u8) -> u32 {
+#[cfg(test)]
+fn erpm_x100_to_rpm(erpm_x100: u32, pole_pairs: u8) -> u32 {
     if pole_pairs == 0 {
         return 0;
     }
     (erpm_x100 / 100) / u32::from(pole_pairs)
 }
 
-/// Convert eRPM * 100 into mechanical Hz for a given number of pole pairs.
-pub fn erpm_x100_to_hz(erpm_x100: u32, pole_pairs: u8) -> u32 {
+#[cfg(test)]
+fn erpm_x100_to_hz(erpm_x100: u32, pole_pairs: u8) -> u32 {
     if pole_pairs == 0 {
         return 0;
     }
     (erpm_x100 / 100) / u32::from(pole_pairs) / 60
 }
 
-/// Convert a telemetry eRPM period into mechanical RPM for a given number of pole pairs.
-pub fn erpm_period_to_rpm(period: u16, pole_pairs: u8) -> u32 {
+#[cfg(test)]
+fn erpm_period_to_rpm(period: u16, pole_pairs: u8) -> u32 {
     let erpm_x100 = erpm_period_to_erpm_x100(period);
     erpm_x100_to_rpm(erpm_x100, pole_pairs)
 }
 
-/// Convert a telemetry eRPM period into mechanical Hz for a given number of pole pairs.
-pub fn erpm_period_to_hz(period: u16, pole_pairs: u8) -> u32 {
+#[cfg(test)]
+fn erpm_period_to_hz(period: u16, pole_pairs: u8) -> u32 {
     let erpm_x100 = erpm_period_to_erpm_x100(period);
     erpm_x100_to_hz(erpm_x100, pole_pairs)
 }
@@ -699,12 +742,14 @@ pub fn decode_gcr(gcr_value: u32) -> Option<u16> {
     Some(result)
 }
 
+#[cfg(test)]
 const GCR_ENCODE_TABLE: [u8; 16] = [
     0b11001, 0b11011, 0b10010, 0b10011, 0b11101, 0b10101, 0b10110, 0b10111, 0b11010, 0b01001,
     0b01010, 0b01011, 0b11110, 0b01101, 0b01110, 0b01111,
 ];
 
-pub fn encode_gcr(payload: u16) -> u32 {
+#[cfg(test)]
+pub(crate) fn encode_gcr(payload: u16) -> u32 {
     let mut gcr_encoded: u32 = 0;
     let mut i = 0;
     while i < 4 {
@@ -1008,7 +1053,7 @@ mod tests {
         let payload = 0x8108;
         assert_eq!(
             parse_telemetry_payload(payload),
-            Err(PayloadParseError::InvalidCrc {
+            Err(TelemetryError::InvalidCrc {
                 calculated_crc: 6,
                 packet_crc: 8,
             })
@@ -1040,7 +1085,7 @@ mod tests {
         let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         assert_eq!(
             parse_telemetry_payload(payload),
-            Err(PayloadParseError::InvalidErpmPeriod)
+            Err(TelemetryError::InvalidErpmPeriod)
         );
     }
 
@@ -1235,7 +1280,7 @@ mod tests {
 
         let decoder = BidirDecoder::new(OversamplingConfig::default());
         let decoded = decoder
-            .decode_frame(&samples, DecodeHint::default())
+            .decode_frame_with_hint(&samples, DecodeHint::default())
             .unwrap();
 
         assert_eq!(decoded, TelemetryFrame::Erpm(ErpmReading::new(1684)));
@@ -1637,10 +1682,7 @@ mod tests {
 
         let samples = [1u32 << 7; 96];
         let frame = decoder.decode_frame_tuned_port_samples(&samples, 1 << 7);
-        assert_eq!(
-            frame,
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-        );
+        assert_eq!(frame, Err(TelemetryError::NoEdge));
         assert_eq!(decoder.stream_hint().preamble_skip, 2);
     }
 
@@ -1656,10 +1698,7 @@ mod tests {
 
         let samples = [1u16; 96];
         let frame = decoder.decode_frame_tuned(&samples);
-        assert_eq!(
-            frame,
-            Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-        );
+        assert_eq!(frame, Err(TelemetryError::NoEdge));
         assert_eq!(decoder.stream_hint().preamble_skip, 2);
     }
 
