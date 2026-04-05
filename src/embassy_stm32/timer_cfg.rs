@@ -1,7 +1,7 @@
 use embassy_stm32_hal::timer::low_level::{OutputCompareMode, OutputPolarity, Timer};
 use embassy_stm32_hal::timer::{Channel, GeneralInstance4Channel};
 
-use super::driver::DshotConfig;
+use super::driver::BidirDshotConfig;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PacerTimerConfig {
@@ -87,12 +87,12 @@ pub(crate) fn compute_pacer_timer_config<T: GeneralInstance4Channel>(
 
 pub(crate) fn compute_rx_timer_config<T: GeneralInstance4Channel>(
     timer: &Timer<'_, T>,
-    config: &DshotConfig,
+    config: &BidirDshotConfig,
 ) -> PacerTimerConfig {
     // Match Betaflight's telemetry input pacing:
     // inputFreq = outputFreq * 5 * 2 * oversample / 24
     // For the BF default oversample=3, this becomes outputFreq * 5 / 4.
-    let symbol_rate_hz = config.speed.timing_hints().nominal_bitrate_hz;
+    let symbol_rate_hz = config.tx.speed.timing_hints().nominal_bitrate_hz;
     let mut rx_sample_hz = symbol_rate_hz * 5 * config.oversampling.oversampling as u32 / 4;
     rx_sample_hz = rx_sample_hz.saturating_mul(config.rx_sample_percent.clamp(1, 200) as u32) / 100;
     compute_pacer_timer_config(timer, rx_sample_hz, config.rx_compare_percent)

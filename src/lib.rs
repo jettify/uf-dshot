@@ -7,6 +7,7 @@ pub mod embassy_stm32;
 mod telemetry;
 
 pub use command::{
+    //
     Command,
     CommandTiming,
     DshotMode,
@@ -19,11 +20,12 @@ pub use command::{
     WaveformTiming,
 };
 pub use telemetry::{
+    //
+    parse_telemetry_payload,
     BidirDecoder,
     ErpmReading,
     OversamplingConfig,
     PreambleTuningConfig,
     TelemetryError,
     TelemetryFrame,
-    parse_telemetry_payload,
 };

@@ -42,7 +42,7 @@ async fn main(_spawner: Spawner) {
 
     info!("spinning at throttle {}", DEMO_THROTTLE);
     loop {
-        unwrap!(esc.send_throttles([DEMO_THROTTLE]).await);
+        unwrap!(esc.send_throttle(DEMO_THROTTLE).await);
         ticker.next().await;
     }
 }

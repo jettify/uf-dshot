@@ -52,14 +52,7 @@ pub enum DshotError {
 pub struct DshotConfig {
     pub speed: DshotSpeed,
     pub tx_timeout: Duration,
-    pub rx_timeout: Duration,
     pub pacer_compare_percent: u8,
-    // Bidir specific
-    pub oversampling: OversamplingConfig,
-    pub preamble_tuning: PreambleTuningConfig,
-    pub pull: Pull,
-    pub rx_compare_percent: u8,
-    pub rx_sample_percent: u8,
 }
 
 impl DshotConfig {
@@ -67,8 +60,38 @@ impl DshotConfig {
         Self {
             speed,
             tx_timeout: Duration::from_millis(2),
-            rx_timeout: Duration::from_millis(2),
             pacer_compare_percent: 50,
+        }
+    }
+
+    pub fn with_tx_timeout(mut self, timeout: Duration) -> Self {
+        self.tx_timeout = timeout;
+        self
+    }
+
+    pub fn with_pacer_compare_percent(mut self, percent: u8) -> Self {
+        self.pacer_compare_percent = percent.clamp(1, 99);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BidirDshotConfig {
+    pub tx: DshotConfig,
+    pub rx_timeout: Duration,
+    pub oversampling: OversamplingConfig,
+    pub preamble_tuning: PreambleTuningConfig,
+    pub pull: Pull,
+    pub rx_compare_percent: u8,
+    pub rx_sample_percent: u8,
+}
+
+impl BidirDshotConfig {
+    pub fn new(speed: DshotSpeed) -> Self {
+        Self {
+            tx: DshotConfig::new(speed),
+            rx_timeout: Duration::from_millis(2),
             oversampling: OversamplingConfig::default(),
             preamble_tuning: PreambleTuningConfig::default(),
             pull: Pull::Up,
@@ -78,7 +101,7 @@ impl DshotConfig {
     }
 
     pub fn with_tx_timeout(mut self, timeout: Duration) -> Self {
-        self.tx_timeout = timeout;
+        self.tx = self.tx.with_tx_timeout(timeout);
         self
     }
 
@@ -88,7 +111,7 @@ impl DshotConfig {
     }
 
     pub fn with_pacer_compare_percent(mut self, percent: u8) -> Self {
-        self.pacer_compare_percent = percent.clamp(1, 99);
+        self.tx = self.tx.with_pacer_compare_percent(percent);
         self
     }
 
@@ -99,6 +122,21 @@ impl DshotConfig {
 
     pub fn with_oversampling(mut self, oversampling: OversamplingConfig) -> Self {
         self.oversampling = oversampling;
+        self
+    }
+
+    pub fn with_preamble_tuning(mut self, preamble_tuning: PreambleTuningConfig) -> Self {
+        self.preamble_tuning = preamble_tuning;
+        self
+    }
+
+    pub fn with_rx_compare_percent(mut self, percent: u8) -> Self {
+        self.rx_compare_percent = percent.clamp(1, 99);
+        self
+    }
+
+    pub fn with_rx_sample_percent(mut self, percent: u8) -> Self {
+        self.rx_sample_percent = percent.clamp(1, 200);
         self
     }
 }
@@ -453,6 +491,20 @@ where
     }
 }
 
+impl<'d, T, D> Stm32DshotPort<'d, T, D, 1>
+where
+    T: GeneralInstance4Channel,
+    D: RawDmaChannel,
+{
+    pub async fn send_throttle(&mut self, throttle: u16) -> Result<(), DshotError> {
+        self.send_throttles([throttle]).await
+    }
+
+    pub async fn send_frame(&mut self, frame: EncodedFrame) -> Result<(), DshotError> {
+        self.send_frames([frame]).await
+    }
+}
+
 pub struct Stm32BidirDshotPort<'d, T, D, const N: usize = 1>
 where
     T: GeneralInstance4Channel,
@@ -464,7 +516,7 @@ where
     pin_masks: [u32; N],
     group_mask: u32,
     channel: Channel,
-    config: DshotConfig,
+    config: BidirDshotConfig,
     tx_timer_cfg: PacerTimerConfig,
     rx_timer_cfg: PacerTimerConfig,
     rx_dma_cfg: PreparedRxDmaConfig,
@@ -487,12 +539,12 @@ where
         (new_ch4, Ch4),
     }
 
-    pub fn set_config(&mut self, config: DshotConfig) {
+    pub fn set_config(&mut self, config: BidirDshotConfig) {
         self.config = config;
         self.tx_timer_cfg = compute_pacer_timer_config(
             &self.timer,
-            self.config.speed.timing_hints().nominal_bitrate_hz * 3,
-            self.config.pacer_compare_percent,
+            self.config.tx.speed.timing_hints().nominal_bitrate_hz * 3,
+            self.config.tx.pacer_compare_percent,
         );
         self.rx_timer_cfg = compute_rx_timer_config(&self.timer, &self.config);
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
@@ -524,17 +576,17 @@ where
         C: TimerChannel,
         D: Dma<T, C>,
     {
+        let pin_set = validate_port_pins(&pins)?;
         let dma_request = dma.request();
         dma.remap();
         drop(dma);
 
-        let pin_set = validate_port_pins(&pins)?;
         let timer = Timer::new(timer);
-        let config = DshotConfig::new(speed);
+        let config = BidirDshotConfig::new(speed);
         let tx_timer_cfg = compute_pacer_timer_config(
             &timer,
             speed.timing_hints().nominal_bitrate_hz * 3,
-            config.pacer_compare_percent,
+            config.tx.pacer_compare_percent,
         );
         let rx_timer_cfg = compute_rx_timer_config(&timer, &config);
         configure_pacer_timer(&timer, C::CHANNEL, tx_timer_cfg);
@@ -578,7 +630,7 @@ where
 
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), DshotError> {
         let frame_period =
-            Duration::from_micros(self.config.speed.timing_hints().min_frame_period_us as u64);
+            Duration::from_micros(self.config.tx.speed.timing_hints().min_frame_period_us as u64);
         let stop_frames = [DshotTx::bidirectional().command(Command::MotorStop); N];
         let deadline = Instant::now() + duration;
 
@@ -627,7 +679,7 @@ where
     }
 
     async fn run_tx_dma(&mut self) -> Result<(), DshotError> {
-        let tx_timeout = self.config.tx_timeout;
+        let tx_timeout = self.config.tx.tx_timeout;
         let session = TxBidirSession::<T, D, N>::start(self)?;
         session.wait_done(tx_timeout).await
     }
@@ -642,7 +694,7 @@ where
     }
 
     async fn run_tx_then_capture(&mut self) -> Result<(), DshotError> {
-        let tx_timeout = self.config.tx_timeout;
+        let tx_timeout = self.config.tx.tx_timeout;
         let rx_timeout = self.config.rx_timeout;
         let total_timeout = tx_timeout + rx_timeout;
         let session = BidirCaptureSession::<T, D, N>::start(self)?;

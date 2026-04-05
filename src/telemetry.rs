@@ -493,7 +493,6 @@ impl BidirDecoder {
             self.stream_tuning_state.hint.preamble_skip -= 1;
         }
     }
-
 }
 
 fn calculate_crc(value: u16) -> u8 {
