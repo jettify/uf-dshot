@@ -1,3 +1,5 @@
+use core::array;
+
 use crate::telemetry::{
     BidirDecoder, DecodeHint, GcrDecodeError, GcrDecodeResult, GcrFrame, OversamplingConfig,
     PayloadParseError, SampleDecodeError, TelemetryFrame, TelemetryPayload, TelemetryPipelineError,
@@ -131,6 +133,17 @@ pub(crate) fn decode_frame_strict_port_samples_u16(
     bit_mask: u16,
 ) -> Result<TelemetryFrame, TelemetryPipelineError> {
     decode_frame_strict_port_samples_with_debug_u16(decoder, samples, bit_mask).frame
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_frame_strict_port_samples_many_u16<const N: usize>(
+    decoders: &mut [BidirDecoder; N],
+    samples: &[u16],
+    bit_masks: [u16; N],
+) -> [Result<TelemetryFrame, TelemetryPipelineError>; N] {
+    array::from_fn(|idx| {
+        decode_frame_strict_port_samples_u16(&mut decoders[idx], samples, bit_masks[idx])
+    })
 }
 
 pub(crate) fn decode_frame_port_samples_with_debug_u16(
@@ -650,6 +663,30 @@ mod tests {
             Ok(TelemetryFrame::Erpm(ErpmReading::new(1684)))
         );
         assert!(outcome.debug.bits_found >= 18);
+    }
+
+    #[test]
+    fn strict_port_decoder_reconstructs_known_frame_for_many_masks() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | 0x5;
+        let gcr = encode_gcr(payload);
+        let (pulse_lengths, pulse_len_count) = pulse_lengths_from_gcr(gcr);
+        let samples_a = build_port_samples_u16(1 << 9, 7, &pulse_lengths[..pulse_len_count]);
+        let samples_b = build_port_samples_u16(1 << 10, 7, &pulse_lengths[..pulse_len_count]);
+        let mut samples = [0u16; 96];
+        for idx in 0..samples.len() {
+            samples[idx] = samples_a[idx] | samples_b[idx];
+        }
+
+        let mut decoders = [
+            BidirDecoder::new(OversamplingConfig::default()),
+            BidirDecoder::new(OversamplingConfig::default()),
+        ];
+        let results =
+            decode_frame_strict_port_samples_many_u16(&mut decoders, &samples, [1 << 9, 1 << 10]);
+
+        assert_eq!(results[0], Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
+        assert_eq!(results[1], Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
     }
 
     #[test]

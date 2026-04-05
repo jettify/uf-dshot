@@ -1,6 +1,5 @@
 use core::array;
 use core::marker::PhantomData;
-use core::slice;
 
 use embassy_stm32_hal::dma::{ChannelInstance as DmaChannelInstance, Request};
 use embassy_stm32_hal::gpio::{AnyPin, Flex, Pin, Pull, Speed};
@@ -13,7 +12,7 @@ use embassy_stm32_hal::timer::{
 use embassy_stm32_hal::Peri;
 use embassy_time::{Duration, Instant, Timer as EmbassyTimer};
 
-use crate::bidir_capture::decode_frame_strict_port_samples_u16;
+use crate::bidir_capture::decode_frame_strict_port_samples_many_u16;
 use crate::telemetry::{
     BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryError, TelemetryFrame,
 };
@@ -262,6 +261,23 @@ fn recommended_capture_samples(oversampling: OversamplingConfig) -> usize {
     oversampling.recommended_capture_samples(PREAMBLE_MARGIN_SAMPLES)
 }
 
+#[doc(hidden)]
+pub trait IntoBidirPins<'d, const N: usize> {
+    fn into_bidir_pins(self) -> [DshotPortPin<'d>; N];
+}
+
+impl<'d> IntoBidirPins<'d, 1> for DshotPortPin<'d> {
+    fn into_bidir_pins(self) -> [DshotPortPin<'d>; 1] {
+        [self]
+    }
+}
+
+impl<'d, const N: usize> IntoBidirPins<'d, N> for [DshotPortPin<'d>; N] {
+    fn into_bidir_pins(self) -> [DshotPortPin<'d>; N] {
+        self
+    }
+}
+
 macro_rules! impl_tx_port_channel_ctors {
     ($(($name:ident, $channel:ty)),+ $(,)?) => {
         $(
@@ -284,17 +300,18 @@ macro_rules! impl_tx_port_channel_ctors {
 macro_rules! impl_bidir_pin_channel_ctors {
     ($(($name:ident, $channel:ty)),+ $(,)?) => {
         $(
-            pub fn $name(
+            pub fn $name<Pins>(
                 timer: Peri<'d, T>,
                 dma: Peri<'d, D>,
                 dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
-                pin: DshotPortPin<'d>,
+                pins: Pins,
                 speed: DshotSpeed,
             ) -> Result<Self, PortConfigError>
             where
                 D: Dma<T, $channel>,
+                Pins: IntoBidirPins<'d, N>,
             {
-                Self::new_inner::<$channel>(timer, dma, dma_irq, pin, speed)
+                Self::new_inner::<$channel>(timer, dma, dma_irq, pins.into_bidir_pins(), speed)
             }
         )+
     };
@@ -436,27 +453,29 @@ where
     }
 }
 
-pub struct Stm32BidirDshotPort<'d, T, D>
+pub struct Stm32BidirDshotPort<'d, T, D, const N: usize = 1>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
     timer: Timer<'d, T>,
     dma_request: Request,
-    pin: DshotPortPin<'d>,
+    pins: [DshotPortPin<'d>; N],
+    pin_masks: [u32; N],
+    group_mask: u32,
     channel: Channel,
     config: DshotConfig,
     tx_timer_cfg: PacerTimerConfig,
     rx_timer_cfg: PacerTimerConfig,
     rx_dma_cfg: PreparedRxDmaConfig,
-    decoder: BidirDecoder,
+    decoders: [BidirDecoder; N],
     tx_words: [u32; TX_STATE_SLOTS],
     raw_samples: [u16; MAX_CAPTURE_SAMPLES],
     irq_state: IrqWakerState,
     _dma: PhantomData<D>,
 }
 
-impl<'d, T, D> Stm32BidirDshotPort<'d, T, D>
+impl<'d, T, D, const N: usize> Stm32BidirDshotPort<'d, T, D, N>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -478,17 +497,18 @@ where
         self.rx_timer_cfg = compute_rx_timer_config(&self.timer, &self.config);
         configure_pacer_timer(&self.timer, self.channel, self.tx_timer_cfg);
 
-        // Update decoder configuration
-        self.decoder = BidirDecoder::with_preamble_tuning(
-            self.config.oversampling,
-            self.config.preamble_tuning,
-        );
+        self.decoders = array::from_fn(|_| {
+            BidirDecoder::with_preamble_tuning(
+                self.config.oversampling,
+                self.config.preamble_tuning,
+            )
+        });
 
         let sample_count = recommended_capture_samples(self.config.oversampling);
         let sample_count = sample_count.min(MAX_CAPTURE_SAMPLES);
         self.rx_dma_cfg = PreparedRxDmaConfig {
             request: self.dma_request,
-            peri_addr: self.pin.idr_ptr(),
+            peri_addr: self.pins[0].idr_ptr(),
             len: sample_count,
         };
     }
@@ -497,7 +517,7 @@ where
         timer: Peri<'d, T>,
         dma: Peri<'d, D>,
         _dma_irq: impl Binding<D::Interrupt, InterruptHandler<D>> + 'd,
-        mut pin: DshotPortPin<'d>,
+        mut pins: [DshotPortPin<'d>; N],
         speed: DshotSpeed,
     ) -> Result<Self, PortConfigError>
     where
@@ -508,6 +528,7 @@ where
         dma.remap();
         drop(dma);
 
+        let pin_set = validate_port_pins(&pins)?;
         let timer = Timer::new(timer);
         let config = DshotConfig::new(speed);
         let tx_timer_cfg = compute_pacer_timer_config(
@@ -517,11 +538,10 @@ where
         );
         let rx_timer_cfg = compute_rx_timer_config(&timer, &config);
         configure_pacer_timer(&timer, C::CHANNEL, tx_timer_cfg);
-        pin.enter_input(config.pull);
-        let pin_idr_ptr = pin.idr_ptr();
-
-        let decoder =
-            BidirDecoder::with_preamble_tuning(config.oversampling, config.preamble_tuning);
+        for pin in pins.iter_mut() {
+            pin.enter_input(config.pull);
+        }
+        let pin_idr_ptr = pins[0].idr_ptr();
 
         let sample_count = recommended_capture_samples(config.oversampling);
         if sample_count > MAX_CAPTURE_SAMPLES {
@@ -534,7 +554,9 @@ where
         Ok(Self {
             timer,
             dma_request,
-            pin,
+            pins,
+            pin_masks: pin_set.pin_masks,
+            group_mask: pin_set.group_mask,
             channel: C::CHANNEL,
             config,
             tx_timer_cfg,
@@ -544,7 +566,9 @@ where
                 peri_addr: pin_idr_ptr,
                 len: sample_count,
             },
-            decoder,
+            decoders: array::from_fn(|_| {
+                BidirDecoder::with_preamble_tuning(config.oversampling, config.preamble_tuning)
+            }),
             tx_words: [0; TX_STATE_SLOTS],
             raw_samples: [0; MAX_CAPTURE_SAMPLES],
             irq_state: IrqWakerState::new(),
@@ -555,11 +579,11 @@ where
     pub async fn arm_for(&mut self, duration: Duration) -> Result<(), DshotError> {
         let frame_period =
             Duration::from_micros(self.config.speed.timing_hints().min_frame_period_us as u64);
-        let stop_frame = DshotTx::bidirectional().command(Command::MotorStop);
+        let stop_frames = [DshotTx::bidirectional().command(Command::MotorStop); N];
         let deadline = Instant::now() + duration;
 
         while Instant::now() < deadline {
-            self.send_frame(stop_frame).await?;
+            self.send_frames(stop_frames).await?;
             EmbassyTimer::after(frame_period).await;
         }
 
@@ -570,32 +594,41 @@ where
         self.arm_for(DEFAULT_ARM_DURATION).await
     }
 
-    pub async fn send_throttle_and_receive(
-        &mut self,
-        throttle: u16,
-    ) -> Result<TelemetryFrame, DshotError> {
-        self.send_frame_and_receive(DshotTx::bidirectional().throttle_clamped(throttle))
-            .await
+    pub async fn send_throttles(&mut self, throttles: [u16; N]) -> Result<(), DshotError> {
+        self.send_frames(
+            throttles.map(|throttle| DshotTx::bidirectional().throttle_clamped(throttle)),
+        )
+        .await
     }
 
-    pub async fn send_frame(&mut self, frame: EncodedFrame) -> Result<(), DshotError> {
-        self.prepare_bidir_frame(frame)?;
+    /// Encodes and transmits one bidirectional DShot frame for each configured pin.
+    pub async fn send_frames(&mut self, frames: [EncodedFrame; N]) -> Result<(), DshotError> {
+        self.prepare_bidir_frames(frames)?;
         self.run_tx_dma().await
     }
 
-    /// Sends one inverted (bidirectional) frame, then captures and decodes return telemetry.
-    pub async fn send_frame_and_receive(
+    /// Encodes and transmits one bidirectional frame for each configured pin, then captures
+    /// and decodes the returned telemetry per pin.
+    pub async fn send_frames_and_receive(
         &mut self,
-        frame: EncodedFrame,
-    ) -> Result<TelemetryFrame, DshotError> {
-        self.prepare_bidir_frame(frame)?;
+        frames: [EncodedFrame; N],
+    ) -> Result<[Result<TelemetryFrame, TelemetryError>; N], DshotError> {
+        self.prepare_bidir_frames(frames)?;
         self.run_tx_then_capture().await?;
-        self.decode_captured_frame()
+        Ok(self.decode_captured_frames())
+    }
+
+    pub async fn send_throttles_and_receive(
+        &mut self,
+        throttles: [u16; N],
+    ) -> Result<[Result<TelemetryFrame, TelemetryError>; N], DshotError> {
+        let frames = throttles.map(|throttle| DshotTx::bidirectional().throttle_clamped(throttle));
+        self.send_frames_and_receive(frames).await
     }
 
     async fn run_tx_dma(&mut self) -> Result<(), DshotError> {
         let tx_timeout = self.config.tx_timeout;
-        let session = TxPinSession::<T, D>::start(self)?;
+        let session = TxBidirSession::<T, D, N>::start(self)?;
         session.wait_done(tx_timeout).await
     }
 
@@ -612,7 +645,7 @@ where
         let tx_timeout = self.config.tx_timeout;
         let rx_timeout = self.config.rx_timeout;
         let total_timeout = tx_timeout + rx_timeout;
-        let session = BidirCaptureSession::<T, D>::start(self)?;
+        let session = BidirCaptureSession::<T, D, N>::start(self)?;
 
         session.wait_done(total_timeout).await?;
 
@@ -652,7 +685,9 @@ where
     }
 
     fn on_tx_complete_start_rx(&mut self) {
-        self.pin.enter_input(self.config.pull);
+        for pin in &mut self.pins {
+            pin.enter_input(self.config.pull);
+        }
         switch_pacer_timer_config_fast(&self.timer, self.channel, self.rx_timer_cfg);
         // Safety: sample buffer and GPIO IDR pointer belong to this controller and are valid
         // throughout the active IRQ-driven capture session.
@@ -671,18 +706,12 @@ where
         self.timer.set_cc_dma_enable_state(self.channel, false);
         self.irq_state.transition(IrqPhase::Done);
     }
-}
 
-impl<'d, T, D> Stm32BidirDshotPort<'d, T, D>
-where
-    T: GeneralInstance4Channel,
-    D: RawDmaChannel,
-{
-    fn prepare_bidir_frame(&mut self, frame: EncodedFrame) -> Result<(), DshotError> {
+    fn prepare_bidir_frames(&mut self, frames: [EncodedFrame; N]) -> Result<(), DshotError> {
         self.tx_words = build_port_words(
-            self.pin.pin_mask(),
-            [self.pin.pin_mask()],
-            [frame],
+            self.group_mask,
+            self.pin_masks,
+            frames,
             SignalPolarity::Inverted,
         )
         .map_err(DshotError::Frame)?
@@ -690,13 +719,47 @@ where
         Ok(())
     }
 
-    fn decode_captured_frame(&mut self) -> Result<TelemetryFrame, DshotError> {
-        decode_frame_strict_port_samples_u16(
-            &mut self.decoder,
+    fn decode_captured_frames(&mut self) -> [Result<TelemetryFrame, TelemetryError>; N] {
+        let mut decoded = [Err(TelemetryError::NoEdge); N];
+        let bit_masks = self.pin_masks.map(|mask| mask as u16);
+        let results = decode_frame_strict_port_samples_many_u16(
+            &mut self.decoders,
             &self.raw_samples[..self.rx_dma_cfg.len],
-            self.pin.pin_mask() as u16,
-        )
-        .map_err(|err| DshotError::Telemetry(err.into()))
+            bit_masks,
+        );
+
+        for idx in 0..N {
+            decoded[idx] = results[idx].map_err(Into::into);
+        }
+
+        decoded
+    }
+}
+
+impl<'d, T, D> Stm32BidirDshotPort<'d, T, D, 1>
+where
+    T: GeneralInstance4Channel,
+    D: RawDmaChannel,
+{
+    pub async fn send_throttle_and_receive(
+        &mut self,
+        throttle: u16,
+    ) -> Result<TelemetryFrame, DshotError> {
+        let [result] = self.send_throttles_and_receive([throttle]).await?;
+        result.map_err(DshotError::Telemetry)
+    }
+
+    pub async fn send_frame(&mut self, frame: EncodedFrame) -> Result<(), DshotError> {
+        self.send_frames([frame]).await
+    }
+
+    /// Sends one inverted (bidirectional) frame, then captures and decodes return telemetry.
+    pub async fn send_frame_and_receive(
+        &mut self,
+        frame: EncodedFrame,
+    ) -> Result<TelemetryFrame, DshotError> {
+        let [result] = self.send_frames_and_receive([frame]).await?;
+        result.map_err(DshotError::Telemetry)
     }
 }
 
@@ -865,30 +928,32 @@ where
     }
 }
 
-struct TxPinSession<'a, 'd, T, D>
+struct TxBidirSession<'a, 'd, T, D, const N: usize>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    controller: &'a mut Stm32BidirDshotPort<'d, T, D>,
+    controller: &'a mut Stm32BidirDshotPort<'d, T, D, N>,
 }
 
-impl<'a, 'd, T, D> TxPinSession<'a, 'd, T, D>
+impl<'a, 'd, T, D, const N: usize> TxBidirSession<'a, 'd, T, D, N>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    fn start(controller: &'a mut Stm32BidirDshotPort<'d, T, D>) -> Result<Self, DshotError> {
-        controller.pin.enter_output_high();
+    fn start(controller: &'a mut Stm32BidirDshotPort<'d, T, D, N>) -> Result<Self, DshotError> {
+        for pin in &mut controller.pins {
+            pin.enter_output_high();
+        }
         let ctx = controller as *mut _ as *mut ();
-        let bsrr = controller.pin.bsrr_ptr();
+        let bsrr = controller.pins[0].bsrr_ptr();
         unsafe {
             begin_tx_dma_session::<D, T>(
                 &controller.timer,
                 controller.channel,
                 controller.tx_timer_cfg,
                 &controller.irq_state,
-                Stm32BidirDshotPort::<T, D>::tx_only_dma_irq,
+                Stm32BidirDshotPort::<T, D, N>::tx_only_dma_irq,
                 ctx,
                 controller.dma_request,
                 &controller.tx_words,
@@ -903,7 +968,7 @@ where
     }
 }
 
-impl<T, D> Drop for TxPinSession<'_, '_, T, D>
+impl<T, D, const N: usize> Drop for TxBidirSession<'_, '_, T, D, N>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -913,36 +978,38 @@ where
             &self.controller.timer,
             self.controller.channel,
             &self.controller.irq_state,
-            slice::from_mut(&mut self.controller.pin),
+            &mut self.controller.pins,
             Some(self.controller.config.pull),
         );
     }
 }
 
-struct BidirCaptureSession<'a, 'd, T, D>
+struct BidirCaptureSession<'a, 'd, T, D, const N: usize>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    controller: &'a mut Stm32BidirDshotPort<'d, T, D>,
+    controller: &'a mut Stm32BidirDshotPort<'d, T, D, N>,
 }
 
-impl<'a, 'd, T, D> BidirCaptureSession<'a, 'd, T, D>
+impl<'a, 'd, T, D, const N: usize> BidirCaptureSession<'a, 'd, T, D, N>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
 {
-    fn start(controller: &'a mut Stm32BidirDshotPort<'d, T, D>) -> Result<Self, DshotError> {
-        controller.pin.enter_output_high();
+    fn start(controller: &'a mut Stm32BidirDshotPort<'d, T, D, N>) -> Result<Self, DshotError> {
+        for pin in &mut controller.pins {
+            pin.enter_output_high();
+        }
         let ctx = controller as *mut _ as *mut ();
-        let bsrr = controller.pin.bsrr_ptr();
+        let bsrr = controller.pins[0].bsrr_ptr();
         unsafe {
             begin_tx_dma_session::<D, T>(
                 &controller.timer,
                 controller.channel,
                 controller.tx_timer_cfg,
                 &controller.irq_state,
-                Stm32BidirDshotPort::<T, D>::dma_irq,
+                Stm32BidirDshotPort::<T, D, N>::dma_irq,
                 ctx,
                 controller.dma_request,
                 &controller.tx_words,
@@ -957,7 +1024,7 @@ where
     }
 }
 
-impl<T, D> Drop for BidirCaptureSession<'_, '_, T, D>
+impl<T, D, const N: usize> Drop for BidirCaptureSession<'_, '_, T, D, N>
 where
     T: GeneralInstance4Channel,
     D: RawDmaChannel,
@@ -967,7 +1034,7 @@ where
             &self.controller.timer,
             self.controller.channel,
             &self.controller.irq_state,
-            slice::from_mut(&mut self.controller.pin),
+            &mut self.controller.pins,
             Some(self.controller.config.pull),
         );
     }
