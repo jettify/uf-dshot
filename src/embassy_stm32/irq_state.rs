@@ -1,4 +1,5 @@
 use core::future::poll_fn;
+use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
@@ -12,27 +13,51 @@ const DMA_IRQ_SLOTS: usize = 16;
 pub(crate) type DmaIrqFn = unsafe fn(*mut ());
 
 struct IrqSlot {
-    func: AtomicPtr<()>,
-    ctx: AtomicPtr<()>,
+    active: AtomicPtr<IrqBinding>,
+    storage: UnsafeCell<IrqBinding>,
 }
+
+#[derive(Clone, Copy)]
+struct IrqBinding {
+    ctx: *mut (),
+    irq_fn: DmaIrqFn,
+}
+
+impl IrqBinding {
+    const fn empty() -> Self {
+        Self {
+            ctx: ptr::null_mut(),
+            irq_fn: empty_irq_fn,
+        }
+    }
+}
+
+unsafe fn empty_irq_fn(_: *mut ()) {}
+
+// Safety: access to `storage` is synchronized by publishing/clearing `active` with
+// release/acquire semantics, and install/clear happen during session transitions.
+unsafe impl Sync for IrqSlot {}
 
 impl IrqSlot {
     const fn new() -> Self {
         Self {
-            func: AtomicPtr::new(ptr::null_mut()),
-            ctx: AtomicPtr::new(ptr::null_mut()),
+            active: AtomicPtr::new(ptr::null_mut()),
+            storage: UnsafeCell::new(IrqBinding::empty()),
         }
     }
+}
 
+impl IrqSlot {
     fn install(&self, ctx: *mut (), irq_fn: DmaIrqFn) {
-        // Store ctx first so it is visible before func (the presence flag).
-        self.ctx.store(ctx, Ordering::Release);
-        self.func.store(irq_fn as *mut (), Ordering::Release);
+        // Prepare the slot-local binding, then publish it as a single presence flag.
+        unsafe {
+            *self.storage.get() = IrqBinding { ctx, irq_fn };
+        }
+        self.active.store(self.storage.get(), Ordering::Release);
     }
 
     fn clear(&self) {
-        self.func.store(ptr::null_mut(), Ordering::Release);
-        self.ctx.store(ptr::null_mut(), Ordering::Release);
+        self.active.store(ptr::null_mut(), Ordering::Release);
     }
 
     /// Dispatches the installed IRQ callback, if present.
@@ -41,11 +66,10 @@ impl IrqSlot {
     /// The registered `ctx` pointer must still be valid and associated with `irq_fn`.
     #[inline(always)]
     unsafe fn dispatch(&self) {
-        let func = self.func.load(Ordering::Acquire);
-        if !func.is_null() {
-            let ctx = self.ctx.load(Ordering::Acquire);
-            let f: DmaIrqFn = unsafe { core::mem::transmute(func) };
-            f(ctx);
+        let binding_ptr = self.active.load(Ordering::Acquire);
+        if !binding_ptr.is_null() {
+            let binding = &*binding_ptr;
+            (binding.irq_fn)(binding.ctx);
         }
     }
 }
@@ -64,6 +88,7 @@ pub(crate) fn clear_irq_slot(slot: usize) {
 ///
 /// # Safety
 /// The slot's registered context pointer must remain valid for the callback duration.
+#[inline(always)]
 pub(crate) unsafe fn dispatch_irq_slot(slot: usize) {
     DMA_IRQ_SLOTS_TABLE[slot].dispatch();
 }
@@ -112,14 +137,17 @@ impl IrqWakerState {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn load_phase(&self) -> IrqPhase {
         IrqPhase::from_u8(self.phase.load(Ordering::Acquire))
     }
 
+    #[inline(always)]
     pub(crate) fn set_phase(&self, phase: IrqPhase) {
         self.phase.store(phase as u8, Ordering::Release);
     }
 
+    #[inline(always)]
     pub(crate) fn transition(&self, phase: IrqPhase) {
         self.set_phase(phase);
         self.waker.wake();

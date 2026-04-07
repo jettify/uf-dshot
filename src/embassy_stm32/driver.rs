@@ -177,6 +177,7 @@ impl<D: RawDmaChannel> Handler<D::Interrupt> for InterruptHandler<D> {
     /// # Safety
     /// Embassy invokes this in the interrupt context for `D`; the registered slot
     /// must hold a valid callback/context pair while DMA is active.
+    #[inline(always)]
     unsafe fn on_interrupt() {
         dispatch_irq_slot(D::IRQ_SLOT);
     }
@@ -714,21 +715,31 @@ where
             Some(false) => this.on_dma_error(),
             Some(true) => {
                 this.timer.set_cc_dma_enable_state(this.channel, false);
-                DmaStream::<D>::disable();
                 match this.irq_state.load_phase() {
-                    IrqPhase::TxActive => this.on_tx_complete_start_rx(),
-                    IrqPhase::RxActive => this.on_rx_complete(),
-                    _ => {}
+                    IrqPhase::TxActive => {
+                        // We must wait here because we immediately reconfigure the same stream
+                        // for RX capture in this IRQ path.
+                        DmaStream::<D>::disable();
+                        this.on_tx_complete_start_rx();
+                    }
+                    IrqPhase::RxActive => {
+                        DmaStream::<D>::disable_no_wait();
+                        this.on_rx_complete();
+                    }
+                    _ => {
+                        DmaStream::<D>::disable_no_wait();
+                    }
                 }
             }
             None => {}
         }
     }
 
+    #[cold]
     fn on_dma_error(&mut self) {
         self.timer.stop();
         self.timer.set_cc_dma_enable_state(self.channel, false);
-        DmaStream::<D>::disable();
+        DmaStream::<D>::disable_no_wait();
         let error_phase = match self.irq_state.load_phase() {
             IrqPhase::RxActive => IrqPhase::RxError,
             _ => IrqPhase::TxError,
@@ -825,12 +836,12 @@ fn handle_tx_complete_irq<D: RawDmaChannel, T: GeneralInstance4Channel>(
         Some(false) => {
             timer.stop();
             timer.set_cc_dma_enable_state(channel, false);
-            DmaStream::<D>::disable();
+            DmaStream::<D>::disable_no_wait();
             irq_state.transition(IrqPhase::TxError);
         }
         Some(true) => {
             timer.set_cc_dma_enable_state(channel, false);
-            DmaStream::<D>::disable();
+            DmaStream::<D>::disable_no_wait();
             timer.stop();
             irq_state.transition(IrqPhase::Done);
         }
