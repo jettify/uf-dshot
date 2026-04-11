@@ -3,7 +3,7 @@ name = "uf-dshot"
 version = "0.1.0"
 edition = "2021"
 authors = ["Mykola Novik <nickolainovik@gmail.com>"]
-license = "GPL-3.0"
+license = "Apache-2.0"
 
 
 rust-version = "1.91.1"
@@ -22,6 +22,8 @@ include = [
   "/tests/**",
   "/examples/**/*.rs",
 ]
+
+keywords = ["dshot", "dshot300", "dshot600", "embassy"]
 
 [dependencies]
 defmt = { version = "1.0.1", optional = true }
