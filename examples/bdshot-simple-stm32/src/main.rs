@@ -34,8 +34,8 @@ async fn main(_spawner: Spawner) {
         p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED,
     ));
 
-    let frame_period =
-        Duration::from_micros(u64::from(ESC_SPEED.timing_hints().min_frame_period_us) * 3);
+    let frame_period = Duration::from_micros(30)
+        + Duration::from_micros(u64::from(ESC_SPEED.timing_hints().min_frame_period_us) * 3);
     let mut ticker = Ticker::every(frame_period);
 
     info!("start arm");
