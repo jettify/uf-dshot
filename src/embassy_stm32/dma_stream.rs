@@ -39,6 +39,22 @@ impl<D: RawDmaChannel> DmaStream<D> {
         while st.cr().read().en() {}
     }
 
+    /// Requests stream disable without waiting for EN to clear.
+    ///
+    /// Intended for interrupt context where bounded latency matters.
+    #[inline(always)]
+    pub(crate) fn disable_no_wait() {
+        let regs = D::regs();
+        let st = regs.st(D::stream_num());
+        st.cr().modify(|w| w.set_en(false));
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_enabled() -> bool {
+        let regs = D::regs();
+        regs.st(D::stream_num()).cr().read().en()
+    }
+
     /// Configures and enables the DMA stream.
     ///
     /// # Safety

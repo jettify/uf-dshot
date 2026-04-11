@@ -714,7 +714,6 @@ where
             Some(false) => this.on_dma_error(),
             Some(true) => {
                 this.timer.set_cc_dma_enable_state(this.channel, false);
-                DmaStream::<D>::disable();
                 match this.irq_state.load_phase() {
                     IrqPhase::TxActive => this.on_tx_complete_start_rx(),
                     IrqPhase::RxActive => this.on_rx_complete(),
@@ -728,7 +727,7 @@ where
     fn on_dma_error(&mut self) {
         self.timer.stop();
         self.timer.set_cc_dma_enable_state(self.channel, false);
-        DmaStream::<D>::disable();
+        DmaStream::<D>::disable_no_wait();
         let error_phase = match self.irq_state.load_phase() {
             IrqPhase::RxActive => IrqPhase::RxError,
             _ => IrqPhase::TxError,
@@ -737,6 +736,7 @@ where
     }
 
     fn on_tx_complete_start_rx(&mut self) {
+        debug_assert!(!DmaStream::<D>::is_enabled());
         for pin in &mut self.pins {
             pin.enter_input(self.config.pull);
         }
@@ -825,12 +825,11 @@ fn handle_tx_complete_irq<D: RawDmaChannel, T: GeneralInstance4Channel>(
         Some(false) => {
             timer.stop();
             timer.set_cc_dma_enable_state(channel, false);
-            DmaStream::<D>::disable();
+            DmaStream::<D>::disable_no_wait();
             irq_state.transition(IrqPhase::TxError);
         }
         Some(true) => {
             timer.set_cc_dma_enable_state(channel, false);
-            DmaStream::<D>::disable();
             timer.stop();
             irq_state.transition(IrqPhase::Done);
         }
