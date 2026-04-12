@@ -758,7 +758,7 @@ mod tests {
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
         let data = 0x7BEu16;
         let packet_crc = (!((data ^ (data >> 4) ^ (data >> 8)) & 0x0F)) & 0x0F;
-        let expected_payload = (data << 4) | packet_crc as u16;
+        let expected_payload = (data << 4) | packet_crc;
         let correct_raw_21 = encode_gcr(expected_payload);
         let buggy_raw_21 = correct_raw_21 ^ (1 << 5); // Flip one bit
 

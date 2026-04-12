@@ -224,9 +224,9 @@ const PAYLOAD_CRC_MASK: u16 = 0x0F;
 const PERIOD_EXPONENT_SHIFT: u16 = 9;
 const PERIOD_EXPONENT_MASK: u16 = 0b111;
 const PERIOD_MANTISSA_MASK: u16 = 0x1FF;
-const EXTENDED_EXPONENT_FLAG_MASK: u16 = 0b001;
-const EXTENDED_MANTISSA_FLAG_MASK: u16 = 0x100;
 const EXTENDED_TYPE_SHIFT: u16 = 8;
+const EXTENDED_TYPE_MASK: u16 = 0x0F;
+const EXTENDED_TYPE_ERPM: u8 = 0x00;
 const EXTENDED_VALUE_MASK: u16 = 0xFF;
 const EXTENDED_TYPE_TEMPERATURE: u8 = 0x02;
 const EXTENDED_TYPE_VOLTAGE: u8 = 0x04;
@@ -522,8 +522,10 @@ fn parse_telemetry_payload_inner(payload: u16) -> Result<TelemetryFrame, Payload
     let exponent = (data >> PERIOD_EXPONENT_SHIFT) & PERIOD_EXPONENT_MASK;
     let mantissa = data & PERIOD_MANTISSA_MASK;
 
-    if is_extended_telemetry(exponent, mantissa) {
-        let telemetry_type = (data >> EXTENDED_TYPE_SHIFT) as u8;
+    let telemetry_type = ((data >> EXTENDED_TYPE_SHIFT) & EXTENDED_TYPE_MASK) as u8;
+    let is_erpm = telemetry_type == EXTENDED_TYPE_ERPM || (telemetry_type & 0x01) != 0;
+
+    if !is_erpm {
         let value = (data & EXTENDED_VALUE_MASK) as u8;
         let t = match telemetry_type {
             EXTENDED_TYPE_TEMPERATURE => TelemetryFrame::Temperature(value),
@@ -551,10 +553,6 @@ fn parse_telemetry_payload_inner(payload: u16) -> Result<TelemetryFrame, Payload
         }
         Ok(TelemetryFrame::Erpm(ErpmReading::new(period)))
     }
-}
-
-const fn is_extended_telemetry(exponent: u16, mantissa: u16) -> bool {
-    (exponent & EXTENDED_EXPONENT_FLAG_MASK) != 0 && (mantissa & EXTENDED_MANTISSA_FLAG_MASK) == 0
 }
 
 #[cfg(test)]
@@ -936,7 +934,8 @@ mod tests {
 
     #[test]
     fn payload_parse_erpm() {
-        let payload = 0x8106;
+        let data = 0x100u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Erpm(ErpmReading::new(256)))
@@ -970,6 +969,40 @@ mod tests {
         assert_eq!(
             parse_telemetry_payload(payload),
             Ok(TelemetryFrame::Temperature(25))
+        );
+    }
+
+    #[test]
+    fn payload_parse_extended_voltage_debug1_debug3() {
+        let voltage_data = 0x42Au16;
+        let voltage_payload = (voltage_data << 4) | calculate_telemetry_crc(voltage_data) as u16;
+        assert_eq!(
+            parse_telemetry_payload(voltage_payload),
+            Ok(TelemetryFrame::Voltage(0x2A))
+        );
+
+        let debug1_data = 0x82Au16;
+        let debug1_payload = (debug1_data << 4) | calculate_telemetry_crc(debug1_data) as u16;
+        assert_eq!(
+            parse_telemetry_payload(debug1_payload),
+            Ok(TelemetryFrame::Debug1(0x2A))
+        );
+
+        let debug3_data = 0xC2Au16;
+        let debug3_payload = (debug3_data << 4) | calculate_telemetry_crc(debug3_data) as u16;
+        assert_eq!(
+            parse_telemetry_payload(debug3_payload),
+            Ok(TelemetryFrame::Debug3(0x2A))
+        );
+    }
+
+    #[test]
+    fn payload_parse_odd_type_is_erpm() {
+        let data = 0x52Au16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
+        assert_eq!(
+            parse_telemetry_payload(payload),
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(0x12A << 2)))
         );
     }
 
@@ -1334,7 +1367,7 @@ mod tests {
         assert_eq!(valid, Ok(TelemetryPayload { raw_16: 0x0123 }));
 
         // Chunk 0 is invalid in decode table.
-        let invalid_encoded = (0u32 << 15) | (27u32 << 10) | (18u32 << 5) | 19u32;
+        let invalid_encoded = (27u32 << 10) | (18u32 << 5) | 19u32;
         let invalid_raw = gcr_raw_from_encoded_20(invalid_encoded);
         let invalid = decoder.decode_payload(GcrFrame {
             raw_21: invalid_raw,
