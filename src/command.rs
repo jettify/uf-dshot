@@ -110,7 +110,11 @@ impl Command {
             | Command::SignalLineTelemetryEnable
             | Command::SignalLineTelemetryDisable
             | Command::SignalLineContinuousERPMTelemetry
-            | Command::SignalLineContinuousERPMPeriodTelemetry => 10,
+            | Command::SignalLineContinuousERPMPeriodTelemetry => {
+                // Protocol docs often mention 6 repeats for these commands.
+                // We intentionally use 10 as a conservative policy, similar to Betaflight.
+                10
+            }
             _ => 1,
         }
     }

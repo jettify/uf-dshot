@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 
 rust-version = "1.91.1"
-description = "uf-dshot"
+description = "no_std library to encode DShot commands and decode bidirectional DShot telemetry for any MCU, with Embassy STM32 support for DShot and bidirectional DShot."
 categories = ["embedded", "no-std"]
 homepage = "https://github.com/jettify/uf-dshot"
 repository = "https://github.com/jettify/uf-dshot"

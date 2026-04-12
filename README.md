@@ -45,7 +45,28 @@ Or use Cargo:
 cargo add uf-dshot
 ```
 
-## Simple Example
+## Core Example (Platform Agnostic)
+
+```rust
+use uf_dshot::{Command, DshotTx};
+
+fn main() {
+    let tx = DshotTx::standard().with_telemetry_request(true);
+
+    let throttle = tx.throttle(200).unwrap();
+    assert!(throttle.payload != 0);
+    assert!(tx.telemetry_request());
+
+    let cmd = tx.command(Command::Beep1);
+    let bits = cmd.bits_msb_first();
+    assert_eq!(bits.len(), 16);
+}
+```
+
+For command execution timing, use `Command::exec_policy()`.
+Commands that are often documented with 6 repeats use a conservative 10-repeat policy in this crate (similar to Betaflight).
+
+## STM32 Embassy Example
 
 
 ```rust
