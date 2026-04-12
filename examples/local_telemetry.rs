@@ -6,7 +6,7 @@ fn print_frame(label: &str, payload: u16) {
             println!(
                 "{label:<20} eRPM period={}us mech_rpm(pole_pairs=14)={}",
                 erpm.period(),
-                erpm.mechanical_rpm(7)
+                erpm.mechanical_rpm(14)
             );
         }
         Ok(TelemetryFrame::Temperature(c)) => {
