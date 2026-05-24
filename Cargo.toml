@@ -1,6 +1,6 @@
 [package]
 name = "uf-dshot"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Mykola Novik <nickolainovik@gmail.com>"]
 license = "Apache-2.0"
