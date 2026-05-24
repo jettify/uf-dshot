@@ -8,6 +8,7 @@
 `uf-dshot` is a `no_std` Rust crate for packing and unpacking DShot frames. It supports standard DShot command and throttle frames, bidirectional DShot telemetry, and an STM32 example backend for Embassy based projects.
 
 ## Features
+<img width="988" height="169" alt="scope" src="https://github.com/user-attachments/assets/8c08d564-06a9-4117-ac05-3bf1d181ed24" />
 
 - Encode DShot throttle and command frames
 - Request telemetry on the separate wire for standard DShot
@@ -15,7 +16,7 @@
 - Provide protocol level types and timing hints for platform code
 - Offer an STM32 specific integration layer behind the `embassy-stm32` feature
 
-## Features
+## Cargo Features
 
 - `defmt`
   - Enables `defmt::Format` for public types
