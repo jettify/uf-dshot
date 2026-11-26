@@ -49,9 +49,9 @@ fn main() {
     match decoder.decode_frame(&samples) {
         Ok(TelemetryFrame::Erpm(erpm)) => {
             println!(
-                "decoded eRPM period={}us mech_rpm(pole_pairs=14)={}",
+                "decoded eRPM period={}us mech_rpm(pole_pairs=7)={}",
                 erpm.period(),
-                erpm.mechanical_rpm(14)
+                erpm.mechanical_rpm(7)
             );
         }
         Ok(other) => println!("decoded frame={other:?}"),

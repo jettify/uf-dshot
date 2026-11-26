@@ -12,7 +12,9 @@ use embassy_time::{Duration, Ticker, Timer};
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 
-use uf_dshot::embassy_stm32::{DshotPortPin, InterruptHandler, Stm32BidirDshotPort};
+use uf_dshot::embassy_stm32::{
+    BidirDshotBuffers, DshotPortPin, InterruptHandler, Stm32BidirDshotPort,
+};
 use uf_dshot::DshotSpeed;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
@@ -57,7 +59,6 @@ async fn run_demo(sender: &Sender<'static, ThreadModeRawMutex, u16, 1>) -> ! {
 #[embassy_executor::task]
 async fn motor_task(
     mut esc: Stm32BidirDshotPort<
-        'static,
         embassy_stm32::peripherals::TIM1,
         embassy_stm32::peripherals::DMA2_CH3,
     >,
@@ -107,8 +108,9 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     let motor_pin = DshotPortPin::new(p.PA8);
+    let dshot_buf = unwrap!(cortex_m::singleton!(: BidirDshotBuffers = BidirDshotBuffers::new()));
     let esc = unwrap!(Stm32BidirDshotPort::new_ch1(
-        p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED,
+        p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED, dshot_buf,
     ));
 
     let sender = THROTTLE_WATCH.sender();

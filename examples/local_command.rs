@@ -31,17 +31,17 @@ fn main() {
     // Bidirectional DShot Frame Encoder
     let bidir_tx = DshotTx::bidirectional();
     let bidir_throttle = bidir_tx.throttle(1000).expect("throttle in 0..=1999");
-    print_frame("bidirdirectional throttle", bidir_throttle);
+    print_frame("bidirectional throttle", bidir_throttle);
 
     let bidir_telem = bidir_tx
         .with_telemetry_request(true)
         .throttle(1000)
         .expect("throttle in 0..=1999");
-    print_frame("bidirdirectional throttle + telem", bidir_telem);
+    print_frame("bidirectional throttle + telem", bidir_telem);
 
     let stop = bidir_tx.command(Command::MotorStop);
-    print_frame("bidirdirectional command MotorStop", stop);
+    print_frame("bidirectional command MotorStop", stop);
 
     let stop = bidir_tx.command(Command::Beep1);
-    print_frame("bidirdirectional command Beep1", stop);
+    print_frame("bidirectional command Beep1", stop);
 }

@@ -701,6 +701,8 @@ dependencies = [
 name = "uf-dshot"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
+ "critical-section",
  "defmt",
  "embassy-stm32",
  "embassy-sync",

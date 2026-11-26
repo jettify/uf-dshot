@@ -52,7 +52,7 @@ pub fn build_port_words<const N: usize>(
     let mut out = PortWords::new();
     init_base_words(&mut out.words, group_mask, polarity);
 
-    for (pin_mask, frame) in pin_masks.into_iter().zip(frames.into_iter()) {
+    for (pin_mask, frame) in pin_masks.into_iter().zip(frames) {
         if pin_mask == 0 || (pin_mask & !group_mask) != 0 {
             return Err(PortFrameError::PinMaskOutsideGroup {
                 pin_mask,

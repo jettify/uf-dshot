@@ -4,19 +4,19 @@ fn print_frame(label: &str, payload: u16) {
     match parse_telemetry_payload(payload) {
         Ok(TelemetryFrame::Erpm(erpm)) => {
             println!(
-                "{label:<20} eRPM period={}us mech_rpm(pole_pairs=14)={}",
+                "{label:<20} eRPM period={}us mech_rpm(pole_pairs=7)={}",
                 erpm.period(),
-                erpm.mechanical_rpm(14)
+                erpm.mechanical_rpm(7)
             );
         }
         Ok(TelemetryFrame::Temperature(c)) => {
             println!("{label:<20} temperature={}C", c);
         }
         Ok(TelemetryFrame::Voltage(v)) => {
-            println!("{label:<20} voltage_raw={} (10mV/LSB)", v);
+            println!("{label:<20} voltage_raw={} (250mV/LSB)", v);
         }
         Ok(TelemetryFrame::Current(i)) => {
-            println!("{label:<20} current_raw={} (100mA/LSB)", i);
+            println!("{label:<20} current_raw={} (1A/LSB)", i);
         }
         Ok(other) => {
             println!("{label:<20} frame={other:?}");

@@ -7,7 +7,7 @@ mod fmt;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use uf_dshot::embassy_stm32::{
-    BidirDshotConfig, DshotPortPin, InterruptHandler, Stm32BidirDshotPort,
+    BidirDshotBuffers, BidirDshotConfig, DshotPortPin, InterruptHandler, Stm32BidirDshotPort,
 };
 use uf_dshot::{Command, DshotSpeed, DshotTx, TelemetryFrame};
 
@@ -51,7 +51,7 @@ fn frame_period() -> Duration {
         + Duration::from_micros((ESC_SPEED.timing_hints().min_frame_period_us as u64) * 3)
 }
 
-async fn arm_for<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>, secs: u64, message: &str)
+async fn arm_for<T, D>(esc: &mut Stm32BidirDshotPort<T, D>, secs: u64, message: &str)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -61,7 +61,7 @@ where
 }
 
 /// Execute a command according to its DShot execution policy (repetitions and timing).
-async fn execute_command<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>, cmd: Command)
+async fn execute_command<T, D>(esc: &mut Stm32BidirDshotPort<T, D>, cmd: Command)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -80,7 +80,7 @@ where
     }
 }
 
-async fn send_stop_frames<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>, frames: usize)
+async fn send_stop_frames<T, D>(esc: &mut Stm32BidirDshotPort<T, D>, frames: usize)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -95,7 +95,7 @@ where
 }
 
 async fn run_command_sequence<T, D>(
-    esc: &mut Stm32BidirDshotPort<'_, T, D>,
+    esc: &mut Stm32BidirDshotPort<T, D>,
     commands: &[CommandStep],
 ) where
     T: embassy_stm32::timer::GeneralInstance4Channel,
@@ -108,7 +108,7 @@ async fn run_command_sequence<T, D>(
 }
 
 async fn send_telemetry_sample<T, D>(
-    esc: &mut Stm32BidirDshotPort<'_, T, D>,
+    esc: &mut Stm32BidirDshotPort<T, D>,
     throttle: u16,
     stats: &mut TelemetryStats,
 ) where
@@ -125,7 +125,7 @@ async fn send_telemetry_sample<T, D>(
 }
 
 /// Brief motor spin at low throttle for direction/mode verification.
-async fn brief_spin<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>, throttle: u16, duration_ms: u32)
+async fn brief_spin<T, D>(esc: &mut Stm32BidirDshotPort<T, D>, throttle: u16, duration_ms: u32)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -168,7 +168,7 @@ where
 
 /// Hold a fixed throttle for a short duration (no ramp).
 async fn hold_throttle<T, D>(
-    esc: &mut Stm32BidirDshotPort<'_, T, D>,
+    esc: &mut Stm32BidirDshotPort<T, D>,
     throttle: u16,
     duration_ms: u32,
 ) where
@@ -197,7 +197,7 @@ async fn hold_throttle<T, D>(
     );
 }
 
-async fn phase_1_beep_test<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_1_beep_test<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -235,7 +235,7 @@ where
     info!("Phase 1 complete — verify: 5 distinct beep tones heard");
 }
 
-async fn phase_2_spin_direction<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_2_spin_direction<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -277,7 +277,7 @@ where
     info!("Phase 2 complete — verify: motor spun both directions");
 }
 
-async fn phase_3_three_d_mode<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_3_three_d_mode<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -311,7 +311,7 @@ where
     info!("Phase 3 complete — verify: 3D mode toggled (if ESC supports it)");
 }
 
-async fn phase_4_led_control<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_4_led_control<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -359,7 +359,7 @@ where
     info!("Phase 4 complete — verify: LEDs toggled (if ESC has them)");
 }
 
-async fn phase_5_extended_telemetry<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_5_extended_telemetry<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -396,7 +396,7 @@ where
     info!("Phase 5 complete");
 }
 
-async fn phase_6_audio_silent_mode<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_6_audio_silent_mode<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -409,7 +409,7 @@ where
     info!("Phase 6 complete");
 }
 
-async fn phase_7_signal_line_telemetry<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_7_signal_line_telemetry<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
@@ -426,16 +426,16 @@ where
     info!("Phase 7 complete");
 }
 
-async fn phase_8_esc_info<T, D>(esc: &mut Stm32BidirDshotPort<'_, T, D>)
+async fn phase_8_esc_info<T, D>(esc: &mut Stm32BidirDshotPort<T, D>)
 where
     T: embassy_stm32::timer::GeneralInstance4Channel,
     D: uf_dshot::embassy_stm32::RawDmaChannel,
 {
     info!("Phase 8: ESC Info");
     info!("Temporarily extending the receive window for ESC info capture...");
-    esc.set_config(
+    unwrap!(esc.set_config(
         BidirDshotConfig::new(ESC_SPEED).with_rx_timeout(ESC_INFO_RX_TIMEOUT),
-    );
+    ));
     info!("Sending ESCInfo command...");
     match esc
         .send_frame_and_receive(DshotTx::bidirectional().command(Command::EscInfo))
@@ -446,7 +446,7 @@ where
     }
 
     // Restore the default receive window for subsequent operations.
-    esc.set_config(BidirDshotConfig::new(ESC_SPEED));
+    unwrap!(esc.set_config(BidirDshotConfig::new(ESC_SPEED)));
     info!("Phase 8 complete");
 }
 
@@ -457,8 +457,9 @@ async fn main(_spawner: Spawner) {
     info!("ESC Command Validation Test (STM32)");
 
     let motor_pin = DshotPortPin::new(p.PA8);
+    let dshot_buf = unwrap!(cortex_m::singleton!(: BidirDshotBuffers = BidirDshotBuffers::new()));
     let mut esc = unwrap!(Stm32BidirDshotPort::new_ch1(
-        p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED,
+        p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED, dshot_buf,
     ));
 
     info!("Arming ESC (5s)...");

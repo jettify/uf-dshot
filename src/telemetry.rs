@@ -97,10 +97,10 @@ impl ErpmReading {
     }
 
     pub const fn mechanical_rpm(self, pole_pairs: u8) -> u32 {
-        if pole_pairs == 0 {
+        if self.period == 0 || pole_pairs == 0 {
             0
         } else {
-            (self.electrical_hz() * 60) / pole_pairs as u32
+            60_000_000 / (self.period as u32 * pole_pairs as u32)
         }
     }
 }
@@ -108,15 +108,22 @@ impl ErpmReading {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TelemetryFrame {
+    /// Electrical RPM period reading (microseconds per electrical revolution).
     Erpm(ErpmReading),
+    /// ESC temperature in degrees Celsius (`1 °C/LSB`).
     Temperature(u8),
+    /// ESC voltage in Extended DShot Telemetry units (`0.25 V/LSB`, i.e., `250 mV/LSB`).
     Voltage(u8),
+    /// ESC current in Extended DShot Telemetry units (`1 A/LSB`).
     Current(u8),
     Debug1(u8),
     Debug2(u8),
     Debug3(u8),
     StateEvent(u8),
-    UnknownExtended { type_id: u8, value: u8 },
+    UnknownExtended {
+        type_id: u8,
+        value: u8,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -670,13 +677,13 @@ where
             let pulse_width_samples = i - last_edge_index;
             let len = ((pulse_width_samples + oversampling / 2) / oversampling).max(1) as u32;
 
-            bits_found += len;
-            gcr_value <<= len;
-            gcr_value |= 1 << (len - 1);
-
+            bits_found = bits_found.saturating_add(len);
             if bits_found > frame_bits {
                 return Err(SampleDecodeError::InvalidFrame);
             }
+
+            gcr_value <<= len;
+            gcr_value |= 1 << (len - 1);
 
             last_edge_index = i;
             last_state_is_high = current_state_is_high;
@@ -699,7 +706,9 @@ where
     })
 }
 
-fn validate_oversampling_config(cfg: OversamplingConfig) -> Result<(), SampleDecodeError> {
+pub(crate) fn validate_oversampling_config(
+    cfg: OversamplingConfig,
+) -> Result<(), SampleDecodeError> {
     if cfg.oversampling == 0 {
         return Err(SampleDecodeError::InvalidConfig);
     }
@@ -1365,8 +1374,13 @@ mod tests {
         let erpm = ErpmReading::new(250);
         assert_eq!(erpm.period(), 250);
         assert_eq!(erpm.electrical_hz(), 4000);
-        assert_eq!(erpm.mechanical_rpm(7), (4000 * 60) / 7);
+        assert_eq!(erpm.mechanical_rpm(7), 60_000_000 / (250 * 7));
         assert_eq!(erpm.mechanical_rpm(0), 0);
+
+        // Avoids premature truncation in electrical_hz() before multiplying by 60.
+        let erpm_600 = ErpmReading::new(600);
+        assert_eq!(erpm_600.mechanical_rpm(7), 14_285);
+        assert_eq!(ErpmReading::new(0).mechanical_rpm(7), 0);
     }
 
     #[test]
@@ -1473,6 +1487,43 @@ mod tests {
     }
 
     #[test]
+    fn stm32_dshot600_capture_decodes_a_reply_after_turnaround_at_eight_times_oversampling() {
+        use crate::stm32_timing::{
+            telemetry_sample_hz, telemetry_window_us, PacerTimerConfig, MAX_CAPTURE_SAMPLES,
+        };
+
+        let config = OversamplingConfig {
+            oversampling: 8,
+            ..OversamplingConfig::default()
+        };
+        let timer_hz = 96_000_000;
+        let bitrate = 600_000;
+        let sample_hz = telemetry_sample_hz(bitrate, config.oversampling, 100);
+        let pacer = PacerTimerConfig::new(timer_hz, sample_hz, 50).unwrap();
+        let window_us = telemetry_window_us(bitrate, config.frame_bits, config.bit_tolerance);
+        let sample_count = pacer.capture_samples(timer_hz, window_us);
+
+        let data = 0x5A5u16;
+        let payload = (data << 4) | u16::from(calculate_telemetry_crc(data));
+        let (lengths, length_count) = pulse_lengths_from_gcr(encode_gcr(payload));
+        let mut samples = [1u16; MAX_CAPTURE_SAMPLES];
+        let mut reply_start = (sample_hz * 30 / 1_000_000) as usize;
+        let mut level = 0;
+        for &symbols in &lengths[..length_count] {
+            let end = reply_start + symbols * usize::from(config.oversampling);
+            samples[reply_start..end].fill(level);
+            reply_start = end;
+            level ^= 1;
+        }
+
+        let mut decoder = BidirDecoder::new(config);
+        assert_eq!(
+            decoder.decode_frame_tuned_port_samples_u16(&samples[..sample_count], 1),
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))),
+        );
+    }
+
+    #[test]
     fn decode_frame_tuned_port_samples_u16_reconstructs_interleaved_pins() {
         let data = 0x5A5u16;
         let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
@@ -1542,6 +1593,27 @@ mod tests {
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
         assert_eq!(
             decoder.decode_frame_tuned_port_samples_u16(&samples, 0x0100),
+            Err(TelemetryError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn decode_gcr_long_pulse_exceeding_31_bits_returns_invalid_frame_without_shift_overflow() {
+        let cfg = OversamplingConfig {
+            sample_bit_index: 0,
+            oversampling: 1,
+            frame_bits: 31,
+            min_detected_bits: 1,
+            bit_tolerance: 31,
+        };
+        let mut samples = [0u16; 64];
+        samples[0] = 1; // preamble high
+                        // 40 consecutive low samples (indices 1..=40), then rising edge at index 41 => len = 40 > 31
+        samples[41] = 1;
+
+        let decoder = BidirDecoder::new(cfg);
+        assert_eq!(
+            decoder.decode_frame(&samples),
             Err(TelemetryError::InvalidFrame)
         );
     }
