@@ -218,7 +218,6 @@ impl From<TelemetryPipelineError> for TelemetryError {
     }
 }
 
-const STREAM_BUFFER_CAPACITY: usize = 256;
 const PAYLOAD_DATA_SHIFT: u16 = 4;
 const PAYLOAD_CRC_MASK: u16 = 0x0F;
 const PERIOD_EXPONENT_SHIFT: u16 = 9;
@@ -258,7 +257,6 @@ impl Default for PreambleTuningState {
 pub struct BidirDecoder {
     pub cfg: OversamplingConfig,
     pub preamble_tuning: PreambleTuningConfig,
-    stream_buf: [u16; STREAM_BUFFER_CAPACITY],
     stream_tuning_state: PreambleTuningState,
 }
 
@@ -281,7 +279,6 @@ impl BidirDecoder {
         Self {
             cfg,
             preamble_tuning,
-            stream_buf: [0; STREAM_BUFFER_CAPACITY],
             stream_tuning_state: PreambleTuningState {
                 hint: DecodeHint { preamble_skip: 0 },
                 min_start_margin: usize::MAX,
@@ -298,6 +295,27 @@ impl BidirDecoder {
         let gcr = self
             .decode_gcr(samples, hint)
             .map_err(TelemetryPipelineError::Samples)?;
+        self.decode_from_gcr(gcr)
+    }
+
+    fn decode_port_samples<T>(
+        &self,
+        samples: &[T],
+        bit_mask: u32,
+        hint: DecodeHint,
+    ) -> Result<DecodedTelemetry, TelemetryPipelineError>
+    where
+        T: Copy + Into<u32>,
+    {
+        let gcr = decode_gcr_from_port_samples_cfg(samples, bit_mask, hint, self.cfg)
+            .map_err(TelemetryPipelineError::Samples)?;
+        self.decode_from_gcr(gcr)
+    }
+
+    fn decode_from_gcr(
+        &self,
+        gcr: GcrDecodeResult,
+    ) -> Result<DecodedTelemetry, TelemetryPipelineError> {
         let payload = self
             .decode_payload(gcr.frame)
             .map_err(TelemetryPipelineError::GcrDecode)?;
@@ -342,9 +360,8 @@ impl BidirDecoder {
         samples: &[u32],
         bit_mask: u32,
     ) -> Result<TelemetryFrame, TelemetryError> {
-        let len = self.fill_stream_buf_from_port_samples(samples, bit_mask);
-        let hint = self.bounded_stream_hint(len);
-        let result = self.decode(&self.stream_buf[..len], hint);
+        let hint = self.bounded_stream_hint(samples.len());
+        let result = self.decode_port_samples(samples, bit_mask, hint);
         self.finish_tuned_decode(result).map_err(Into::into)
     }
 
@@ -353,33 +370,9 @@ impl BidirDecoder {
         samples: &[u16],
         bit_mask: u16,
     ) -> Result<TelemetryFrame, TelemetryError> {
-        let len = self.fill_stream_buf_from_port_samples(samples, u32::from(bit_mask));
-        let hint = self.bounded_stream_hint(len);
-        let result = self.decode(&self.stream_buf[..len], hint);
+        let hint = self.bounded_stream_hint(samples.len());
+        let result = self.decode_port_samples(samples, u32::from(bit_mask), hint);
         self.finish_tuned_decode(result).map_err(Into::into)
-    }
-
-    pub(crate) fn decode_frame_from_gcr_tuned(
-        &mut self,
-        gcr: Result<GcrDecodeResult, SampleDecodeError>,
-    ) -> Result<TelemetryFrame, TelemetryPipelineError> {
-        match gcr {
-            Ok(gcr) => {
-                let payload = self
-                    .decode_payload(gcr.frame)
-                    .map_err(TelemetryPipelineError::GcrDecode)?;
-                let frame = self
-                    .parse_payload(payload)
-                    .map_err(TelemetryPipelineError::PayloadParse)?;
-                self.observe_start_margin(gcr.start_margin);
-                Ok(frame)
-            }
-            Err(SampleDecodeError::NoEdge) => {
-                self.observe_no_edge();
-                Err(TelemetryPipelineError::Samples(SampleDecodeError::NoEdge))
-            }
-            Err(err) => Err(TelemetryPipelineError::Samples(err)),
-        }
     }
 
     pub(crate) fn decode_gcr(
@@ -435,33 +428,6 @@ impl BidirDecoder {
             hint.preamble_skip = len.saturating_sub(1);
         }
         hint
-    }
-
-    fn sample_level_mask(&self) -> u16 {
-        if self.cfg.sample_bit_index < 16 {
-            1u16 << self.cfg.sample_bit_index
-        } else {
-            1
-        }
-    }
-
-    fn fill_stream_buf_from_port_samples<T>(&mut self, samples: &[T], bit_mask: u32) -> usize
-    where
-        T: Copy + Into<u32>,
-    {
-        let len = samples.len().min(self.stream_buf.len());
-        let sample_level_mask = self.sample_level_mask();
-        for (dst, sample) in self.stream_buf[..len]
-            .iter_mut()
-            .zip(samples.iter().copied())
-        {
-            *dst = if (sample.into() & bit_mask) != 0 {
-                sample_level_mask
-            } else {
-                0
-            };
-        }
-        len
     }
 
     fn observe_start_margin(&mut self, start_margin: usize) {
@@ -647,6 +613,26 @@ fn decode_gcr_from_samples_cfg(
         });
     }
 
+    decode_gcr_from_port_samples_cfg(samples, 1u32 << cfg.sample_bit_index, hint, cfg)
+}
+
+fn decode_gcr_from_port_samples_cfg<T>(
+    samples: &[T],
+    bit_mask: u32,
+    hint: DecodeHint,
+    cfg: OversamplingConfig,
+) -> Result<GcrDecodeResult, SampleDecodeError>
+where
+    T: Copy + Into<u32>,
+{
+    validate_oversampling_config(cfg)?;
+
+    if bit_mask == 0 {
+        return Err(SampleDecodeError::InvalidSampleBitIndex {
+            bit: cfg.sample_bit_index,
+        });
+    }
+
     if hint.preamble_skip >= samples.len() {
         return Err(SampleDecodeError::NoEdge);
     }
@@ -658,12 +644,11 @@ fn decode_gcr_from_samples_cfg(
         cfg.frame_bits.saturating_sub(cfg.bit_tolerance) as usize * oversampling;
     let max_frame_samples = (cfg.frame_bits as usize + cfg.bit_tolerance as usize) * oversampling;
 
-    let mask = 1u16 << cfg.sample_bit_index;
     let start_margin = samples
         .iter()
         .enumerate()
         .skip(hint.preamble_skip)
-        .find(|&(_, &sample)| (sample & mask) == 0)
+        .find(|&(_, &sample)| (sample.into() & bit_mask) == 0)
         .map(|(idx, _)| idx)
         .ok_or(SampleDecodeError::NoEdge)?;
 
@@ -680,7 +665,7 @@ fn decode_gcr_from_samples_cfg(
     let mut last_state_is_high = false;
 
     for (i, &sample) in frame_samples.iter().enumerate().skip(1) {
-        let current_state_is_high = (sample & mask) != 0;
+        let current_state_is_high = (sample.into() & bit_mask) != 0;
         if current_state_is_high != last_state_is_high {
             let pulse_width_samples = i - last_edge_index;
             let len = ((pulse_width_samples + oversampling / 2) / oversampling).max(1) as u32;
@@ -1428,5 +1413,136 @@ mod tests {
         assert_eq!(erpm_period_to_erpm_x100(0), 0);
         assert_eq!(erpm_x100_to_rpm(1000, 0), 0);
         assert_eq!(erpm_x100_to_hz(1000, 0), 0);
+    }
+
+    #[test]
+    fn bidir_decoder_is_compact_without_stream_buffer() {
+        assert!(core::mem::size_of::<BidirDecoder>() <= 64);
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_rejects_zero_bit_mask() {
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        let samples_u32 = [0u32; 96];
+        let samples_u16 = [0u16; 96];
+
+        assert_eq!(
+            decoder.decode_frame_tuned_port_samples(&samples_u32, 0),
+            Err(TelemetryError::InvalidSampleBitIndex { bit: 0 })
+        );
+        assert_eq!(
+            decoder.decode_frame_tuned_port_samples_u16(&samples_u16, 0),
+            Err(TelemetryError::InvalidSampleBitIndex { bit: 0 })
+        );
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_handles_buffers_over_256_samples() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let short_samples = build_signal_samples(
+            0,
+            0,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+
+        let bit_mask_u16 = 1u16 << 9;
+        let mut port_samples_u16 = [bit_mask_u16; 512];
+        let mut port_samples_u32 = [u32::from(bit_mask_u16); 512];
+        let offset = 300usize;
+        for (i, sample) in short_samples.iter().copied().enumerate() {
+            let level = if sample != 0 { bit_mask_u16 } else { 0 };
+            port_samples_u16[offset + i] = level;
+            port_samples_u32[offset + i] = u32::from(level);
+        }
+
+        let mut decoder_u16 = BidirDecoder::new(OversamplingConfig::default());
+        let mut decoder_u32 = BidirDecoder::new(OversamplingConfig::default());
+
+        assert_eq!(
+            decoder_u16.decode_frame_tuned_port_samples_u16(&port_samples_u16, bit_mask_u16),
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(1684)))
+        );
+        assert_eq!(
+            decoder_u32.decode_frame_tuned_port_samples(&port_samples_u32, u32::from(bit_mask_u16)),
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(1684)))
+        );
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_u16_reconstructs_interleaved_pins() {
+        let data = 0x5A5u16;
+        let payload = (data << 4) | calculate_telemetry_crc(data) as u16;
+        let gcr = encode_gcr(payload);
+        let (bit_lengths, lengths_len) = pulse_lengths_from_gcr(gcr);
+        let samples_a = build_signal_samples(
+            9,
+            7,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+        let samples_b = build_signal_samples(
+            10,
+            11,
+            &bit_lengths[..lengths_len],
+            OversamplingConfig::default().oversampling as usize,
+        );
+        let mut combined = [0u16; 96];
+        for idx in 0..combined.len() {
+            combined[idx] = samples_a[idx] | samples_b[idx];
+        }
+
+        let mut decoders = [
+            BidirDecoder::new(OversamplingConfig::default()),
+            BidirDecoder::new(OversamplingConfig::default()),
+        ];
+        let masks = [1u16 << 9, 1u16 << 10];
+        let results: [Result<TelemetryFrame, TelemetryError>; 2] = core::array::from_fn(|idx| {
+            decoders[idx].decode_frame_tuned_port_samples_u16(&combined, masks[idx])
+        });
+
+        assert_eq!(results[0], Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
+        assert_eq!(results[1], Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))));
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_u16_reports_no_edge_on_idle_high() {
+        let samples = [1u16 << 4; 96];
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        assert_eq!(
+            decoder.decode_frame_tuned_port_samples_u16(&samples, 1 << 4),
+            Err(TelemetryError::NoEdge)
+        );
+    }
+
+    #[test]
+    fn decode_frame_tuned_port_samples_u16_replays_truncated_capture_as_invalid_frame() {
+        let samples = [
+            0xE400, 0xE400, 0xE500, 0xE500, 0xE500, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400,
+            0xE500, 0xE500, 0xE500, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400, 0xE400,
+            0xE400, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+            0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500, 0xE500,
+        ];
+
+        let mut decoder = BidirDecoder::new(OversamplingConfig::default());
+        assert_eq!(
+            decoder.decode_frame_tuned_port_samples_u16(&samples, 0x0100),
+            Err(TelemetryError::InvalidFrame)
+        );
     }
 }

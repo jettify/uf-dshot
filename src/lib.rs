@@ -1,6 +1,5 @@
 #![no_std]
 
-mod bidir_capture;
 mod command;
 #[cfg(all(feature = "embassy-stm32", target_arch = "arm", target_os = "none"))]
 pub mod embassy_stm32;
