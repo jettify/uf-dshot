@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/jettify/uf-dshot/compare/v0.1.0...v0.1.1) - 2026-11-26
+
+### Added
+
+- Efficient gcr decoding. ([#20](https://github.com/jettify/uf-dshot/issues/20))
+
+### Other
+
+- Update README.md
+- release v0.1.0 ([#18](https://github.com/jettify/uf-dshot/issues/18))
+
 ## [0.1.0](https://github.com/jettify/uf-dshot/releases/tag/v0.1.0) - 2026-04-12
 
 ### Added
