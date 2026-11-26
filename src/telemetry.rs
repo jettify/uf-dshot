@@ -97,10 +97,10 @@ impl ErpmReading {
     }
 
     pub const fn mechanical_rpm(self, pole_pairs: u8) -> u32 {
-        if pole_pairs == 0 {
+        if self.period == 0 || pole_pairs == 0 {
             0
         } else {
-            (self.electrical_hz() * 60) / pole_pairs as u32
+            60_000_000 / (self.period as u32 * pole_pairs as u32)
         }
     }
 }
@@ -108,15 +108,22 @@ impl ErpmReading {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TelemetryFrame {
+    /// Electrical RPM period reading (microseconds per electrical revolution).
     Erpm(ErpmReading),
+    /// ESC temperature in degrees Celsius (`1 °C/LSB`).
     Temperature(u8),
+    /// ESC voltage in Extended DShot Telemetry units (`0.25 V/LSB`, i.e., `250 mV/LSB`).
     Voltage(u8),
+    /// ESC current in Extended DShot Telemetry units (`1 A/LSB`).
     Current(u8),
     Debug1(u8),
     Debug2(u8),
     Debug3(u8),
     StateEvent(u8),
-    UnknownExtended { type_id: u8, value: u8 },
+    UnknownExtended {
+        type_id: u8,
+        value: u8,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1365,8 +1372,13 @@ mod tests {
         let erpm = ErpmReading::new(250);
         assert_eq!(erpm.period(), 250);
         assert_eq!(erpm.electrical_hz(), 4000);
-        assert_eq!(erpm.mechanical_rpm(7), (4000 * 60) / 7);
+        assert_eq!(erpm.mechanical_rpm(7), 60_000_000 / (250 * 7));
         assert_eq!(erpm.mechanical_rpm(0), 0);
+
+        // Avoids premature truncation in electrical_hz() before multiplying by 60.
+        let erpm_600 = ErpmReading::new(600);
+        assert_eq!(erpm_600.mechanical_rpm(7), 14_285);
+        assert_eq!(ErpmReading::new(0).mechanical_rpm(7), 0);
     }
 
     #[test]

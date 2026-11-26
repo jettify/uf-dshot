@@ -20,8 +20,10 @@ pub use command::{
 };
 pub use telemetry::{
     //
+    decode_gcr,
     parse_telemetry_payload,
     BidirDecoder,
+    DecodeHint,
     ErpmReading,
     OversamplingConfig,
     PreambleTuningConfig,
