@@ -190,17 +190,12 @@ impl DshotTx {
     }
 
     pub const fn with_telemetry_request(mut self, enabled: bool) -> Self {
-        if matches!(self.mode, DshotMode::Standard) {
-            self.request_separate_wire_telemetry = enabled;
-        }
+        self.request_separate_wire_telemetry = enabled;
         self
     }
 
     pub const fn telemetry_request(self) -> bool {
-        match self.mode {
-            DshotMode::Standard => self.request_separate_wire_telemetry,
-            DshotMode::Bidirectional => true,
-        }
+        self.request_separate_wire_telemetry
     }
 
     pub fn throttle(self, raw: u16) -> Result<EncodedFrame, ThrottleError> {
@@ -226,16 +221,18 @@ impl DshotTx {
     }
 
     pub fn command(self, command: Command) -> EncodedFrame {
-        self.encode_raw_value(command as u16, None)
+        // Per the DShot specification, special commands 1..=47 require the telemetry bit to be 1;
+        // only MotorStop (0) uses the configured telemetry request bit.
+        let telemetry_override = if command != Command::MotorStop {
+            Some(true)
+        } else {
+            None
+        };
+        self.encode_raw_value(command as u16, telemetry_override)
     }
 
     fn encode_raw_value(self, raw_value: u16, telemetry_override: Option<bool>) -> EncodedFrame {
-        let telemetry_bit = match self.mode {
-            DshotMode::Standard => {
-                telemetry_override.unwrap_or(self.request_separate_wire_telemetry)
-            }
-            DshotMode::Bidirectional => true,
-        };
+        let telemetry_bit = telemetry_override.unwrap_or(self.request_separate_wire_telemetry);
 
         let data_12 = encode_data_12(raw_value, telemetry_bit);
         let base = base_crc(data_12);
@@ -365,6 +362,13 @@ mod tests {
         );
         assert_eq!(
             DshotTx::bidirectional().throttle_clamped(5000).data_12(),
+            0xFFE
+        );
+        assert_eq!(
+            DshotTx::bidirectional()
+                .with_telemetry_request(true)
+                .throttle_clamped(5000)
+                .data_12(),
             0xFFF
         );
     }
@@ -399,9 +403,17 @@ mod tests {
     #[test]
     fn bidir_inverted_crc_vector() {
         let frame = DshotTx::bidirectional().throttle(1000).unwrap();
-        assert_eq!(frame.payload, 0x8315);
-        assert_eq!(frame.data_12(), 0x831);
-        assert_eq!(frame.crc_4(), 0x5);
+        assert_eq!(frame.payload, 0x8304);
+        assert_eq!(frame.data_12(), 0x830);
+        assert_eq!(frame.crc_4(), 0x4);
+
+        let frame_telem = DshotTx::bidirectional()
+            .with_telemetry_request(true)
+            .throttle(1000)
+            .unwrap();
+        assert_eq!(frame_telem.payload, 0x8315);
+        assert_eq!(frame_telem.data_12(), 0x831);
+        assert_eq!(frame_telem.crc_4(), 0x5);
     }
 
     #[test]
@@ -477,9 +489,50 @@ mod tests {
     }
 
     #[test]
-    fn bidir_forces_telemetry_even_when_override_is_false() {
+    fn bidir_respects_telemetry_request_and_override() {
         let tx = DshotTx::bidirectional();
-        let frame = tx.throttle_with_telemetry_request(1000, false).unwrap();
-        assert_eq!(frame.data_12(), 0x831);
+        assert!(!tx.telemetry_request());
+        assert_eq!(tx.throttle(1000).unwrap().data_12(), 0x830);
+        assert_eq!(
+            tx.throttle_with_telemetry_request(1000, true)
+                .unwrap()
+                .data_12(),
+            0x831
+        );
+
+        let tx_telem = tx.with_telemetry_request(true);
+        assert!(tx_telem.telemetry_request());
+        assert_eq!(
+            tx_telem
+                .throttle_with_telemetry_request(1000, false)
+                .unwrap()
+                .data_12(),
+            0x830
+        );
+    }
+
+    #[test]
+    fn special_commands_set_telemetry_bit_while_motor_stop_respects_config() {
+        let std_tx = DshotTx::standard();
+        assert_eq!(std_tx.command(Command::Beep1).payload, 0x0033);
+        assert_eq!(std_tx.command(Command::MotorStop).payload, 0x0000);
+        assert_eq!(
+            std_tx
+                .with_telemetry_request(true)
+                .command(Command::MotorStop)
+                .payload,
+            0x0011
+        );
+
+        let bidir_tx = DshotTx::bidirectional();
+        assert_eq!(bidir_tx.command(Command::Beep1).payload, 0x003C);
+        assert_eq!(bidir_tx.command(Command::MotorStop).payload, 0x000F);
+        assert_eq!(
+            bidir_tx
+                .with_telemetry_request(true)
+                .command(Command::MotorStop)
+                .payload,
+            0x001E
+        );
     }
 }

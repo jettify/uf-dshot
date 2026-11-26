@@ -24,7 +24,7 @@ clean:
 # Install cargo tools used in package maintenance
 [group('build')]
 install_dev_tools:
-  echo "Installing optional tools for depelopment."
+  echo "Installing optional tools for development."
   cargo install --locked release-plz
   cargo install --locked cargo-audit
   cargo install --locked cargo-outdated
