@@ -670,13 +670,13 @@ where
             let pulse_width_samples = i - last_edge_index;
             let len = ((pulse_width_samples + oversampling / 2) / oversampling).max(1) as u32;
 
-            bits_found += len;
-            gcr_value <<= len;
-            gcr_value |= 1 << (len - 1);
-
+            bits_found = bits_found.saturating_add(len);
             if bits_found > frame_bits {
                 return Err(SampleDecodeError::InvalidFrame);
             }
+
+            gcr_value <<= len;
+            gcr_value |= 1 << (len - 1);
 
             last_edge_index = i;
             last_state_is_high = current_state_is_high;
@@ -1542,6 +1542,27 @@ mod tests {
         let mut decoder = BidirDecoder::new(OversamplingConfig::default());
         assert_eq!(
             decoder.decode_frame_tuned_port_samples_u16(&samples, 0x0100),
+            Err(TelemetryError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn decode_gcr_long_pulse_exceeding_31_bits_returns_invalid_frame_without_shift_overflow() {
+        let cfg = OversamplingConfig {
+            sample_bit_index: 0,
+            oversampling: 1,
+            frame_bits: 31,
+            min_detected_bits: 1,
+            bit_tolerance: 31,
+        };
+        let mut samples = [0u16; 64];
+        samples[0] = 1; // preamble high
+                        // 40 consecutive low samples (indices 1..=40), then rising edge at index 41 => len = 40 > 31
+        samples[41] = 1;
+
+        let decoder = BidirDecoder::new(cfg);
+        assert_eq!(
+            decoder.decode_frame(&samples),
             Err(TelemetryError::InvalidFrame)
         );
     }
