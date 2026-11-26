@@ -23,6 +23,7 @@
 - `embassy-stm32`
   - Enables Embassy based STM32 helpers
   - Pulls in `embassy-sync`, `embassy-time`, and the STM32 HAL dependency
+  - Currently targets STM32 DMA v2 stream controllers (STM32F2/F4/F7, e.g. STM32F405); STM32H7 (`DMAMUX1`) support is planned
 
 ## Installation
 
@@ -83,7 +84,9 @@ use embassy_time::{Duration, Ticker};
 use panic_halt as _;
 
 use embassy_executor::Spawner;
-use uf_dshot::embassy_stm32::{DshotPortPin, InterruptHandler, Stm32BidirDshotPort};
+use uf_dshot::embassy_stm32::{
+    BidirDshotBuffers, DshotPortPin, InterruptHandler, Stm32BidirDshotPort,
+};
 use uf_dshot::DshotSpeed;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
@@ -102,9 +105,10 @@ async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
     let motor_pin = DshotPortPin::new(p.PA8);
+    let dshot_buf = unwrap!(cortex_m::singleton!(: BidirDshotBuffers = BidirDshotBuffers::new()));
 
     let mut esc = unwrap!(Stm32BidirDshotPort::new_ch1(
-        p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED,
+        p.TIM1, p.DMA2_CH3, DmaIrqs, motor_pin, ESC_SPEED, dshot_buf,
     ));
 
     let frame_period =

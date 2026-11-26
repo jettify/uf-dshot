@@ -3,6 +3,12 @@
 mod command;
 #[cfg(all(feature = "embassy-stm32", target_arch = "arm", target_os = "none"))]
 pub mod embassy_stm32;
+#[cfg(any(
+    test,
+    all(feature = "embassy-stm32", target_arch = "arm", target_os = "none")
+))]
+#[path = "embassy_stm32/timing.rs"]
+mod stm32_timing;
 mod telemetry;
 
 pub use command::{

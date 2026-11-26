@@ -706,7 +706,9 @@ where
     })
 }
 
-fn validate_oversampling_config(cfg: OversamplingConfig) -> Result<(), SampleDecodeError> {
+pub(crate) fn validate_oversampling_config(
+    cfg: OversamplingConfig,
+) -> Result<(), SampleDecodeError> {
     if cfg.oversampling == 0 {
         return Err(SampleDecodeError::InvalidConfig);
     }
@@ -1481,6 +1483,43 @@ mod tests {
         assert_eq!(
             decoder_u32.decode_frame_tuned_port_samples(&port_samples_u32, u32::from(bit_mask_u16)),
             Ok(TelemetryFrame::Erpm(ErpmReading::new(1684)))
+        );
+    }
+
+    #[test]
+    fn stm32_dshot600_capture_decodes_a_reply_after_turnaround_at_eight_times_oversampling() {
+        use crate::stm32_timing::{
+            telemetry_sample_hz, telemetry_window_us, PacerTimerConfig, MAX_CAPTURE_SAMPLES,
+        };
+
+        let config = OversamplingConfig {
+            oversampling: 8,
+            ..OversamplingConfig::default()
+        };
+        let timer_hz = 96_000_000;
+        let bitrate = 600_000;
+        let sample_hz = telemetry_sample_hz(bitrate, config.oversampling, 100);
+        let pacer = PacerTimerConfig::new(timer_hz, sample_hz, 50).unwrap();
+        let window_us = telemetry_window_us(bitrate, config.frame_bits, config.bit_tolerance);
+        let sample_count = pacer.capture_samples(timer_hz, window_us);
+
+        let data = 0x5A5u16;
+        let payload = (data << 4) | u16::from(calculate_telemetry_crc(data));
+        let (lengths, length_count) = pulse_lengths_from_gcr(encode_gcr(payload));
+        let mut samples = [1u16; MAX_CAPTURE_SAMPLES];
+        let mut reply_start = (sample_hz * 30 / 1_000_000) as usize;
+        let mut level = 0;
+        for &symbols in &lengths[..length_count] {
+            let end = reply_start + symbols * usize::from(config.oversampling);
+            samples[reply_start..end].fill(level);
+            reply_start = end;
+            level ^= 1;
+        }
+
+        let mut decoder = BidirDecoder::new(config);
+        assert_eq!(
+            decoder.decode_frame_tuned_port_samples_u16(&samples[..sample_count], 1),
+            Ok(TelemetryFrame::Erpm(ErpmReading::new(1684))),
         );
     }
 

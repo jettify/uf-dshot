@@ -1,4 +1,5 @@
 use core::marker::PhantomData;
+use core::sync::atomic::{fence, Ordering};
 
 use embassy_stm32_hal::dma::Request;
 use embassy_stm32_hal::pac;
@@ -8,13 +9,8 @@ use super::driver::RawDmaChannel;
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedRxDmaConfig {
     pub(crate) request: Request,
-    pub(crate) peri_addr: *mut u16,
+    pub(crate) peri_addr: u32,
     pub(crate) len: usize,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum DmaInterruptMode {
-    Irq,
 }
 
 pub(crate) struct DmaStream<D>(PhantomData<D>);
@@ -26,17 +22,24 @@ impl<D: RawDmaChannel> DmaStream<D> {
         let idx = stream / 4;
         let bit = stream % 4;
         regs.ifcr(idx).write(|w| {
+            w.set_feif(bit, true);
+            w.set_dmeif(bit, true);
+            w.set_teif(bit, true);
             w.set_htif(bit, true);
             w.set_tcif(bit, true);
-            w.set_teif(bit, true);
         });
     }
 
     pub(crate) fn disable() {
         let regs = D::regs();
         let st = regs.st(D::stream_num());
-        st.cr().modify(|w| w.set_en(false));
+        st.cr().modify(|w| {
+            w.set_en(false);
+            w.set_tcie(false);
+            w.set_teie(false);
+        });
         while st.cr().read().en() {}
+        fence(Ordering::Acquire);
     }
 
     /// Requests stream disable without waiting for EN to clear.
@@ -46,7 +49,11 @@ impl<D: RawDmaChannel> DmaStream<D> {
     pub(crate) fn disable_no_wait() {
         let regs = D::regs();
         let st = regs.st(D::stream_num());
-        st.cr().modify(|w| w.set_en(false));
+        st.cr().modify(|w| {
+            w.set_en(false);
+            w.set_tcie(false);
+            w.set_teie(false);
+        });
     }
 
     #[inline(always)]
@@ -59,14 +66,13 @@ impl<D: RawDmaChannel> DmaStream<D> {
     ///
     /// # Safety
     /// `mem_addr` and `peri_addr` must be valid for `len` transfers with the selected `dir`/`size`.
-    pub(crate) unsafe fn configure_and_start(
+    unsafe fn configure_and_start(
         request: Request,
         mem_addr: u32,
         peri_addr: u32,
         len: usize,
         dir: pac::dma::vals::Dir,
         size: pac::dma::vals::Size,
-        interrupts: DmaInterruptMode,
         reset: bool,
     ) {
         let regs = D::regs();
@@ -74,14 +80,16 @@ impl<D: RawDmaChannel> DmaStream<D> {
 
         if reset {
             Self::disable();
-            Self::clear_flags();
         }
+        // STM32 DMA v2 requires all stream event flags to be cleared before setting EN = 1.
+        Self::clear_flags();
 
         st.par().write_value(peri_addr);
         st.m0ar().write_value(mem_addr);
         st.ndtr().write_value(pac::dma::regs::Ndtr(len as _));
         st.fcr()
             .write(|w| w.set_dmdis(pac::dma::vals::Dmdis::ENABLED));
+        fence(Ordering::Release);
         st.cr().write(|w| {
             w.set_dir(dir);
             w.set_msize(size);
@@ -89,8 +97,8 @@ impl<D: RawDmaChannel> DmaStream<D> {
             w.set_pl(pac::dma::vals::Pl::VERY_HIGH);
             w.set_minc(true);
             w.set_pinc(false);
-            w.set_teie(matches!(interrupts, DmaInterruptMode::Irq));
-            w.set_tcie(matches!(interrupts, DmaInterruptMode::Irq));
+            w.set_teie(true);
+            w.set_tcie(true);
             w.set_htie(false);
             w.set_circ(false);
             w.set_chsel(request);
@@ -110,7 +118,6 @@ impl<D: RawDmaChannel> DmaStream<D> {
         mem_addr: *const u32,
         peri_addr: *mut u32,
         len: usize,
-        interrupts: DmaInterruptMode,
     ) {
         Self::configure_and_start(
             request,
@@ -119,7 +126,6 @@ impl<D: RawDmaChannel> DmaStream<D> {
             len,
             pac::dma::vals::Dir::MEMORY_TO_PERIPHERAL,
             pac::dma::vals::Size::BITS32,
-            interrupts,
             true,
         );
     }
@@ -128,18 +134,14 @@ impl<D: RawDmaChannel> DmaStream<D> {
     ///
     /// # Safety
     /// `mem_addr` and `cfg.peri_addr` must remain valid for `cfg.len` 16-bit transfers.
-    pub(crate) unsafe fn start_prepared_read_no_reset(
-        cfg: PreparedRxDmaConfig,
-        mem_addr: *mut u16,
-    ) {
+    pub(crate) unsafe fn start_prepared_read_no_reset(cfg: PreparedRxDmaConfig, mem_addr: u32) {
         Self::configure_and_start(
             cfg.request,
-            mem_addr as u32,
-            cfg.peri_addr as u32,
+            mem_addr,
+            cfg.peri_addr,
             cfg.len,
             pac::dma::vals::Dir::PERIPHERAL_TO_MEMORY,
             pac::dma::vals::Size::BITS16,
-            DmaInterruptMode::Irq,
             false,
         );
     }
@@ -152,8 +154,7 @@ pub(crate) fn check_and_clear_dma_irq_flags<D: RawDmaChannel>() -> Option<bool> 
     let bit = D::stream_num() % 4;
 
     if isr.teif(bit) {
-        regs.ifcr(D::stream_num() / 4)
-            .write(|w| w.set_teif(bit, true));
+        DmaStream::<D>::clear_flags();
         return Some(false);
     }
     if isr.tcif(bit) {
