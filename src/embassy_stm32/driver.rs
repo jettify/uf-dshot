@@ -12,7 +12,6 @@ use embassy_stm32_hal::timer::{
 use embassy_stm32_hal::Peri;
 use embassy_time::{Duration, Instant, Timer as EmbassyTimer};
 
-use crate::bidir_capture::decode_frame_strict_port_samples_many_u16;
 use crate::telemetry::{
     BidirDecoder, OversamplingConfig, PreambleTuningConfig, TelemetryError, TelemetryFrame,
 };
@@ -772,19 +771,11 @@ where
     }
 
     fn decode_captured_frames(&mut self) -> [Result<TelemetryFrame, TelemetryError>; N] {
-        let mut decoded = [Err(TelemetryError::NoEdge); N];
-        let bit_masks = self.pin_masks.map(|mask| mask as u16);
-        let results = decode_frame_strict_port_samples_many_u16(
-            &mut self.decoders,
-            &self.raw_samples[..self.rx_dma_cfg.len],
-            bit_masks,
-        );
-
-        for idx in 0..N {
-            decoded[idx] = results[idx].map_err(Into::into);
-        }
-
-        decoded
+        let samples = &self.raw_samples[..self.rx_dma_cfg.len];
+        array::from_fn(|idx| {
+            self.decoders[idx]
+                .decode_frame_tuned_port_samples_u16(samples, self.pin_masks[idx] as u16)
+        })
     }
 }
 
